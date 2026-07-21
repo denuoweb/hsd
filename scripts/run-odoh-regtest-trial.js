@@ -11,7 +11,7 @@ const sha256 = require('bcrypto/lib/sha256');
 const FullNode = require('../lib/node/fullnode');
 const NetAddress = require('../lib/net/netaddress');
 const common = require('../lib/net/common');
-const {createLocator} = require('../lib/net/odoh');
+const {createLocator, decodeConfigList} = require('../lib/net/odoh');
 
 const QUERY = Buffer.from(
   '123401100001000000000001037777770972656c6179746573740000010001'
@@ -185,11 +185,16 @@ async function main() {
     const record = await requester.odoh.getConfig(
       requesterProxyPeer,
       locator);
+    const rotationTime = Math.floor(Date.now() / 1000);
+    assert(await target.odoh.rotateTargetKey(rotationTime, true));
     const response = await requester.odoh.query(
       requesterProxyPeer,
       locator,
       record,
       QUERY);
+    const rotatedRecord = await requester.odoh.getConfig(
+      requesterProxyPeer,
+      locator);
 
     assert(response.equals(RESPONSE));
     assert.strictEqual(backend.queries.length, 1);
@@ -201,6 +206,10 @@ async function main() {
       proxyView.clientRequestID.equals(targetView.targetRequestID),
       false);
     assert.strictEqual(proxy.odoh.getMetrics().proxyPlaintextBytes, 0);
+    assert.strictEqual(rotatedRecord.sequence, record.sequence + 1);
+    assert.strictEqual(
+      decodeConfigList(rotatedRecord.odohConfigs).length,
+      2);
 
     const result = {
       schema: 1,
@@ -227,7 +236,14 @@ async function main() {
         signatureVerified: true,
         configRecordID: record.id.toString('hex'),
         locatorMatched: record.locator.targetKey.equals(locator.targetKey),
-        expiresAt: record.expiresAt
+        expiresAt: record.expiresAt,
+        rotation: {
+          previousSequence: record.sequence,
+          currentSequence: rotatedRecord.sequence,
+          overlappingConfigs: decodeConfigList(
+            rotatedRecord.odohConfigs).length,
+          previousRecordAcceptedAfterRotation: response.equals(RESPONSE)
+        }
       },
       privacy: {
         queryAbsentFromProxyCiphertext: !proxyView.ciphertext.includes(QUERY),

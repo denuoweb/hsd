@@ -27,9 +27,13 @@ The PoC implements:
 - RFC 9230 configuration, message, padding, key-ID, and response encoding;
 - RFC 9180 DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and AES-128-GCM through
   the maintained `@hpke` packages;
+- deterministic, published configuration, key-ID, padding, response-KDF, and
+  signed-record vectors in `test/data/odoh-v1-vectors.json`;
 - independent random request IDs on the requester-proxy and proxy-target hops;
 - bounded proxy mappings, deadlines, cancellation, and disconnect cleanup;
 - target replay detection;
+- automatic 22-hour HPKE key rotation with a two-hour old-key/record overlap,
+  monotonically increasing record sequence numbers, and retired-key wiping;
 - generic target failure mapping without a decryption oracle;
 - reuse of the base P2P DNS relay service after target decryption;
 - public-address enforcement, with a narrow explicit regtest loopback/private
@@ -37,12 +41,12 @@ The PoC implements:
 - preconnected authenticated target selection, with no arbitrary socket
   forwarding.
 
-The PoC deliberately does not implement HNSR locators, target connection
-establishment on demand, config caching, key rotation/overlap, persistent key
-storage, multi-target scheduling, outer bucket padding, or production
-telemetry. A proxy can forward only to an already connected outbound Brontide
-peer whose address, port, authenticated peer key, service bits, and target role
-match the signed locator.
+HNSR locators, target connection establishment on demand, config caching,
+persistent key storage, multi-target scheduling, outer bucket padding, and
+production telemetry are optional extensions outside this direct-locator
+reference profile. A proxy can forward only to an already connected outbound
+Brontide peer whose address, port, authenticated peer key, service bits, and
+target role match the signed locator.
 
 ## Configuration
 
@@ -64,6 +68,8 @@ Regtest-only private target addresses:
 Limits:
   --experimental-odoh-timeout=<milliseconds>
   --experimental-odoh-max-live=<count>
+  --experimental-odoh-key-rotation=<seconds, default 79200>
+  --experimental-odoh-key-overlap=<seconds, default 7200>
 ```
 
 `--experimental-odoh-instrumentation` is a regtest-only test hook. It emits
@@ -103,6 +109,8 @@ The runner fails unless all of these hold:
   ciphertext;
 - the target sees the exact admitted raw query;
 - client and target request IDs differ;
+- a rotated record advertises the new and overlapping old key, increases its
+  sequence, and the previous record still completes an in-flight query;
 - the base relay accepts exactly one request and returns exactly one response;
 - the requester receives the expected response;
 - the requester rejects malformed, non-recursive, or mismatched DNS replies;
@@ -126,12 +134,17 @@ Therefore the result does not claim:
 - requester-side Urkel, DNSSEC, TLSA, or DANE validation;
 - an Android/iOS application-binary run;
 - HNSR target reachability;
-- key rotation, overlap, failover, load, or anonymity-set measurements;
+- multi-pair failover, load, or anonymity-set measurements;
 - readiness for testnet or mainnet.
 
-Those are separate acceptance tiers. In particular, the browser's existing
-direct P2P DNS relay trial is evidence for the prerequisite path, not evidence
-that the browser currently implements this ODoH extension.
+Those claims require the separate composed browser tier. The companion browser
+reference implementation at `Denuo-Web/hns-dane-browser` commit `477c4e8`
+provides an independent Rust requester and a real four-`hsd` regtest runner.
+That runner combines a mined registered name, current Urkel proofs, a distinct
+ODoH proxy and Brontide target, live recursion, local DNSSEC and TLSA/DANE,
+HTTPS 200, and zero legacy-DoH contacts. The three-node artifact from this
+repository remains the focused transport, cryptographic, and key-rotation
+evidence; the two tiers are complementary rather than interchangeable.
 
 ## Verification
 
@@ -148,5 +161,5 @@ npm run test-file -- \
 The tests cover strict envelope/body parsing, locator restrictions, signed
 config verification, all-zero padding, HPKE query/response round trips, wrong
 keys, requester-side DNS response correlation, proxy/target routing,
-independent hop IDs, replay rejection, and the prerequisite DNS-relay and
-network packet regression suites.
+independent hop IDs, key rotation and overlap, replay rejection, and the
+prerequisite DNS-relay and network packet regression suites.

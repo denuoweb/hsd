@@ -1,6 +1,8 @@
 'use strict';
 
 const assert = require('bsert');
+const fs = require('fs');
+const path = require('path');
 const secp256k1 = require('bcrypto/lib/secp256k1');
 const common = require('../lib/net/common');
 const packets = require('../lib/net/packets');
@@ -16,6 +18,10 @@ const {
   decodePlaintext,
   encodeConfigs,
   decodeConfigs,
+  decodeConfigList,
+  encodeConfigContents,
+  deriveKeyID,
+  deriveResponseSecrets,
   encodeCaps,
   decodeCaps,
   encodeGetConfig,
@@ -42,6 +48,9 @@ const RESPONSE = Buffer.from(
   '123481b00001000100000001037777770972656c6179746573740000010001'
   + 'c00c000100010000003c0004c000020100002904d0000080000000',
   'hex');
+const VECTORS = JSON.parse(fs.readFileSync(
+  path.join(__dirname, 'data', 'odoh-v1-vectors.json'),
+  'utf8'));
 
 function tick() {
   return new Promise(resolve => setImmediate(resolve));
@@ -243,6 +252,50 @@ describe('P2P ODoH', function() {
   });
 
   describe('RFC 9230 cryptography and target records', function() {
+    it('should match the published deterministic profile vectors', () => {
+      const input = VECTORS.inputs;
+      const expected = VECTORS.expected;
+      const identity = Buffer.from(input.targetIdentityPrivateKey, 'hex');
+      const publicKey = Buffer.from(input.hpkePublicKey, 'hex');
+      const locator = createLocator(
+        input.targetHost,
+        input.targetPort,
+        Buffer.from(input.targetPeerKey, 'hex'),
+        true);
+      const contents = encodeConfigContents(publicKey);
+      const configs = encodeConfigs(publicKey);
+      const plaintext = encodePlaintext(
+        Buffer.from(input.dnsQuery, 'hex'),
+        128);
+      const secrets = deriveResponseSecrets(
+        Buffer.from(input.responseSecret, 'hex'),
+        plaintext,
+        Buffer.from(input.responseNonce, 'hex'));
+      const record = new TargetConfigRecord({
+        networkMagic: input.networkMagic,
+        locator,
+        sequence: input.sequence,
+        issuedAt: input.issuedAt,
+        expiresAt: input.expiresAt,
+        odohConfigs: configs
+      }).sign(identity);
+
+      assert.strictEqual(encodeLocator(locator).toString('hex'),
+        expected.locator);
+      assert.strictEqual(contents.toString('hex'), expected.configContents);
+      assert.strictEqual(configs.toString('hex'), expected.configs);
+      assert.strictEqual(deriveKeyID(contents).toString('hex'),
+        expected.keyID);
+      assert.strictEqual(plaintext.toString('hex'), expected.queryPlaintext);
+      assert.strictEqual(secrets.key.toString('hex'), expected.responseKey);
+      assert.strictEqual(secrets.nonce.toString('hex'),
+        expected.responseNonce);
+      assert.strictEqual(record.raw.toString('hex'),
+        expected.targetConfigRecord);
+      assert.strictEqual(record.id.toString('hex'),
+        expected.targetConfigRecordID);
+    });
+
     it('should encrypt a query and response without proxy plaintext', async() => {
       const crypto = new ODoHCrypto();
       const pair = await crypto.generateKeyPair();
@@ -471,6 +524,27 @@ describe('P2P ODoH', function() {
         sent.body));
       await tick();
       assert.strictEqual(target.getMetrics().replays, 1);
+    });
+
+    it('should rotate keys while accepting an overlapping record', async() => {
+      const locator = createLocator(
+        '127.0.0.1',
+        14039,
+        secp256k1.publicKeyCreate(targetIdentity),
+        true);
+      const previous = await requester.getConfig(requesterProxy, locator);
+      const now = Math.floor(Date.now() / 1000);
+
+      assert(await target.rotateTargetKey(now, true));
+
+      const current = await requester.getConfig(requesterProxy, locator);
+      assert.strictEqual(current.sequence, previous.sequence + 1);
+      assert.strictEqual(decodeConfigList(current.odohConfigs).length, 2);
+      assert.bufferEqual(
+        await requester.query(
+          requesterProxy, locator, previous, QUERY),
+        RESPONSE);
+      assert.strictEqual(target.getMetrics().rotations, 2);
     });
   });
 });
