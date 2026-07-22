@@ -154,6 +154,40 @@ describe('HNSR', function() {
       false);
   });
 
+  it('should bind a renewal to its previous reservation', () => {
+    const item = fixture();
+    const context = Buffer.from('0102030405060708', 'hex');
+    const previous = Buffer.alloc(16, 0x04);
+    const request = new ReserveRequest({
+      endpointKey: item.endpointKey,
+      profile: 1,
+      lifetime: 1800,
+      maxCircuits: 8,
+      maxBytes: 1048576,
+      nonce: Buffer.alloc(16, 0x05)
+    }).signRenewal(
+      network.magic,
+      item.relayKey,
+      context,
+      previous,
+      item.endpointPrivate);
+    const decoded = ReserveRequest.decode(request.encode());
+
+    assert(decoded.verifyRenewal(
+      network.magic,
+      item.relayKey,
+      context,
+      previous));
+    assert.strictEqual(decoded.verifyRenewal(
+      network.magic,
+      item.relayKey,
+      context,
+      Buffer.alloc(16, 0x06)), false);
+    assert.strictEqual(
+      decoded.verify(network.magic, item.relayKey, context),
+      false);
+  });
+
   it('should round trip and authenticate a relay ticket', () => {
     const item = fixture();
     const decoded = RelayTicket.decode(item.ticket.encode());
