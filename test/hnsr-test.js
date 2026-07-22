@@ -1,8 +1,12 @@
 'use strict';
 
 const assert = require('bsert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const base32 = require('bcrypto/lib/encoding/base32');
 const secp256k1 = require('bcrypto/lib/secp256k1');
+const IP = require('binet');
 const FullNode = require('../lib/node/fullnode');
 const Network = require('../lib/protocol/network');
 const common = require('../lib/net/common');
@@ -15,9 +19,12 @@ const {
   ServiceAuthorization,
   EndpointDelegation,
   RouteRecord,
+  RoutingTable,
   RouteStore,
   RendezvousContact,
   CircuitSocket,
+  HNSRService,
+  bucketIndex,
   rendezvousNodeID,
   compareDistance,
   opcodes,
@@ -177,6 +184,44 @@ function namedFixture(timestamp = Math.floor(Date.now() / 1000)) {
     record,
     timestamp
   };
+}
+
+function contactFixture(host, timestamp = Math.floor(Date.now() / 1000)) {
+  const privateKey = secp256k1.privateKeyGenerate();
+  const peerKey = secp256k1.publicKeyCreate(privateKey, true);
+
+  return new RendezvousContact({
+    nodeID: rendezvousNodeID(network.magic, peerKey),
+    hostType: 1,
+    host: IP.toBuffer(host),
+    port: network.brontidePort,
+    services: common.services.NETWORK
+      | common.EXPERIMENTAL_HNSR_RENDEZVOUS_SERVICE,
+    peerKey,
+    observedAt: timestamp
+  });
+}
+
+function waitFor(test, timeout = 2000) {
+  const started = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (test()) {
+        resolve();
+        return;
+      }
+
+      if (Date.now() - started >= timeout) {
+        reject(new Error('Timed out waiting for HNSR test condition.'));
+        return;
+      }
+
+      setTimeout(check, 5);
+    };
+
+    check();
+  });
 }
 
 describe('HNSR', function() {
@@ -649,6 +694,215 @@ describe('HNSR', function() {
     assert.strictEqual(retained.sequence, 1);
   });
 
+  it('should bound persistent XOR buckets and reject netgroup Sybils', () => {
+    const selfKey = secp256k1.publicKeyCreate(
+      secp256k1.privateKeyGenerate(),
+      true);
+    const selfID = rendezvousNodeID(network.magic, selfKey);
+    const table = new RoutingTable(network.magic, selfID, network, {
+      bucketSize: 4,
+      maxEntries: 64,
+      maxPerNetgroup: 2
+    });
+    const selected = [];
+    let targetBucket = -1;
+
+    for (let index = 0; selected.length < 3 && index < 500; index++) {
+      const third = Math.floor(index / 254);
+      const fourth = index % 254 + 1;
+      const contact = contactFixture(`8.8.${third}.${fourth}`);
+      const bucket = bucketIndex(selfID, contact.nodeID);
+
+      if (targetBucket === -1)
+        targetBucket = bucket;
+
+      if (bucket === targetBucket)
+        selected.push(contact);
+    }
+
+    assert.strictEqual(selected.length, 3);
+    assert(table.add(selected[0]));
+    assert(table.add(selected[1]));
+    assert.strictEqual(table.add(selected[2]), false);
+    assert.strictEqual(table.buckets[targetBucket].length, 2);
+
+    for (let index = 0; index < 200; index++)
+      table.add(contactFixture(`9.${index + 1}.1.1`));
+
+    assert(table.contacts.size <= 64);
+    assert(table.buckets.every(bucket => bucket.length <= 4));
+    assert(table.closest(Buffer.alloc(32), 8).length <= 8);
+
+    const rejected = contactFixture('127.0.0.1');
+    assert.strictEqual(table.add(rejected), false);
+
+    const key = selected[0].peerKey;
+    assert(table.markAttempt(key, false));
+    assert(table.markAttempt(key, false));
+    assert(table.markAttempt(key, false));
+    assert.strictEqual(table.contacts.has(key.toString('hex')), false);
+  });
+
+  it('should enforce route storage quotas across a source prefix', () => {
+    const first = fixture();
+    const second = fixture();
+    const store = new RouteStore(network.magic, {
+      maxRecords: 4,
+      maxPerPeer: 4,
+      maxPerPrefix: 1
+    });
+
+    store.put(
+      first.key,
+      first.record.encode(),
+      first.timestamp,
+      'peer-a',
+      '4:080804');
+    assert.throws(() => store.put(
+      second.key,
+      second.record.encode(),
+      second.timestamp,
+      'peer-b',
+      '4:080804'), /per-prefix route capacity/);
+    store.put(
+      second.key,
+      second.record.encode(),
+      second.timestamp,
+      'peer-b',
+      '4:090901');
+    assert.strictEqual(store.size, 2);
+  });
+
+  it('should recover routing and route state after restart', async () => {
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'hsd-hnsr-state-'));
+    const identityKey = secp256k1.privateKeyGenerate();
+    const item = fixture();
+    const contact = contactFixture('8.8.8.8');
+    const options = {
+      enabled: true,
+      rendezvous: true,
+      network,
+      identityKey,
+      memory: false,
+      persist: true,
+      prefix
+    };
+
+    try {
+      const first = new HNSRService(options);
+      await first.open();
+      assert(first.routing.add(contact));
+      first.store.put(
+        item.key,
+        item.record.encode(),
+        item.timestamp,
+        'peer-a',
+        '4:080808');
+      first.routeSequence = 12;
+      first.endpointSequence = 9;
+      first._markStateDirty();
+      await first.close();
+
+      const second = new HNSRService(options);
+      await second.open();
+      assert.strictEqual(second.contacts.size, 1);
+      assert.strictEqual(second.store.size, 1);
+      assert.strictEqual(second.routeSequence, 12);
+      assert.strictEqual(second.endpointSequence, 9);
+      assert.bufferEqual(
+        second.store.get(item.key, 1, item.timestamp)[0],
+        item.record.encode());
+      await second.close();
+    } finally {
+      fs.rmSync(prefix, {recursive: true, force: true});
+    }
+  });
+
+  it('should republish immediately after a network change', async () => {
+    const item = fixture();
+    const service = new HNSRService({
+      enabled: true,
+      endpoint: true,
+      network,
+      identityKey: item.endpointPrivate,
+      memory: true
+    });
+    let calls = 0;
+
+    service.republish = async () => {
+      calls += 1;
+      return {record: item.record, stored: [], failures: []};
+    };
+
+    await service.open();
+    const state = service.startRepublisher(
+      {record: item.record},
+      [item.ticket],
+      []);
+    service.notifyNetworkChange();
+    await waitFor(() => state.successes === 1);
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(service.getTelemetry().republishSuccesses, 1);
+    assert(service.stopRepublisher(state));
+    await service.close();
+  });
+
+  it('should prioritize node relay traffic while keeping web traffic fair',
+    async () => {
+      const item = fixture();
+      const service = new HNSRService({
+        enabled: true,
+        relay: true,
+        network,
+        identityKey: item.relayPrivate,
+        memory: true
+      });
+      const sent = [];
+      const nodePeer = {
+        id: 1,
+        destroyed: false,
+        send(packet) {
+          sent.push({profile: profiles.HNS_NODE_V1, packet});
+        }
+      };
+      const webPeer = {
+        id: 2,
+        destroyed: false,
+        send(packet) {
+          sent.push({profile: profiles.HNS_WEB_V1, packet});
+        }
+      };
+      const nodeState = {
+        closed: false,
+        queuedBytes: 0,
+        circuitID: Buffer.alloc(8, 0x01),
+        ticket: {profile: profiles.HNS_NODE_V1}
+      };
+      const webState = {
+        closed: false,
+        queuedBytes: 0,
+        circuitID: Buffer.alloc(8, 0x02),
+        ticket: {profile: profiles.HNS_WEB_V1}
+      };
+
+      await service.open();
+
+      for (let index = 0; index < 8; index++) {
+        service._queueRelayData(
+          {state: webState, other: webPeer},
+          Buffer.alloc(4096, 0x02));
+        service._queueRelayData(
+          {state: nodeState, other: nodePeer},
+          Buffer.alloc(4096, 0x01));
+      }
+
+      await waitFor(() => service.relayQueueBytes === 0);
+      assert.strictEqual(sent[0].profile, profiles.HNS_NODE_V1);
+      assert(sent.some(item => item.profile === profiles.HNS_WEB_V1));
+      assert.strictEqual(service.getTelemetry().relayDrops, 0);
+      await service.close();
+    });
+
   it('should apply circuit backpressure and delayed window credit', async () => {
     const sent = [];
     const service = {
@@ -719,5 +973,40 @@ describe('HNSR', function() {
       experimentalHnsr: true,
       experimentalHnsrRelay: true
     }), /regtest-only/);
+  });
+
+  it('should require explicit acknowledgement and a public testnet host', () => {
+    assert.throws(() => new FullNode({
+      network: 'testnet',
+      memory: true,
+      listen: true,
+      noDns: true,
+      experimentalHnsr: true,
+      experimentalHnsrRelay: true
+    }), /explicitly acknowledged/);
+
+    assert.throws(() => new FullNode({
+      network: 'testnet',
+      memory: true,
+      listen: true,
+      noDns: true,
+      experimentalHnsr: true,
+      experimentalHnsrRelay: true,
+      experimentalHnsrTestnet: true
+    }), /require a public host/);
+
+    const node = new FullNode({
+      network: 'testnet',
+      memory: true,
+      listen: true,
+      noDns: true,
+      publicHost: '8.8.8.8',
+      experimentalHnsr: true,
+      experimentalHnsrRelay: true,
+      experimentalHnsrTestnet: true
+    });
+
+    assert(node.hnsr.enabled);
+    assert(node.hnsr.relay);
   });
 });

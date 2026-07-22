@@ -672,6 +672,11 @@ async function main() {
 
     await closeNode(relays[0], opened);
 
+    // Earlier named-service checks intentionally populate relay health with
+    // timing-dependent scores. Reset that history so this Phase 1 regression
+    // deterministically attempts the now-dead first ticket before failing over.
+    requester.hnsr.relayHealth.clear();
+
     const endpointVirtualPromise = waitEvent(endpoint.hnsr, 'virtual peer');
     const openedRoute = await requester.hnsr.openPeer(
       replicatedLookup.records[0]);
