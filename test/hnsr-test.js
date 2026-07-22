@@ -64,7 +64,7 @@ function fixture(timestamp = Math.floor(Date.now() / 1000), sequence = 1) {
     expiresAt: timestamp + 900,
     maxActiveCircuits: 8,
     maxBytesPerCircuit: 1048576
-  }).sign(endpointPrivate);
+  }).sign(network.magic, endpointPrivate);
   const key = routeKey(network.magic, endpointKey);
   const record = new RouteRecord({
     routeKey: key,
