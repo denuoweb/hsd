@@ -6,20 +6,16 @@ const assert = require('bsert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const random = require('bcrypto/lib/random');
 const secp256k1 = require('bcrypto/lib/secp256k1');
 const sha256 = require('bcrypto/lib/sha256');
 const FullNode = require('../lib/node/fullnode');
 const Address = require('../lib/primitives/address');
 const NetAddress = require('../lib/net/netaddress');
-const Parser = require('../lib/net/parser');
-const Framer = require('../lib/net/framer');
 const packets = require('../lib/net/packets');
 const common = require('../lib/net/common');
-const {BrontideStream} = require('../lib/net/brontide');
 const {opcodes, routeKey} = require('../lib/net/hnsr');
 
-function waitFor(test, message, timeout = 10000) {
+function waitFor(test, message, timeout = 15000) {
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
@@ -48,11 +44,40 @@ function waitFor(test, message, timeout = 10000) {
   });
 }
 
-function peerAddress(node, port) {
+function waitEvent(emitter, event, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    let onEvent = null;
+    const cleanup = () => {
+      clearTimeout(timer);
+      emitter.removeListener(event, onEvent);
+    };
+    onEvent = (...args) => {
+      cleanup();
+      resolve(args);
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for ${event}.`));
+    }, timeout);
+
+    emitter.once(event, onEvent);
+  });
+}
+
+function identity() {
+  return secp256k1.privateKeyGenerate();
+}
+
+function publicKey(key) {
+  return secp256k1.publicKeyCreate(key, true);
+}
+
+function nodeAddress(key, port) {
   return NetAddress.fromHost(
     '127.0.0.1',
     port,
-    secp256k1.publicKeyCreate(node.identityKey, true),
+    publicKey(key),
     'regtest').hostname;
 }
 
@@ -79,43 +104,31 @@ function nodeOptions(prefix, identityKey, ports, extra = {}) {
     logLevel: process.env.HNSR_TRIAL_DEBUG === '1' ? 'debug' : 'none',
     logFile: false,
     persistentMempool: false,
-    maxOutbound: 2,
+    maxOutbound: 12,
     experimentalHnsr: true
   }, extra);
 }
 
-function findPeer(node, services) {
-  for (let peer = node.pool.peers.head(); peer; peer = peer.next) {
-    if (peer.ack && (peer.services & services) === services)
-      return peer;
+function ports(base, index) {
+  return {
+    p2p: base + index,
+    brontide: base + 16 + index,
+    http: base + 32 + index
+  };
+}
+
+function findPeer(node, key) {
+  const peer = node.pool.findHNSRPeer(publicKey(key));
+  return peer && peer.handshake && !peer.destroyed ? peer : null;
+}
+
+function opcodeName(value) {
+  for (const [name, opcode] of Object.entries(opcodes)) {
+    if (opcode === value)
+      return name;
   }
 
-  return null;
-}
-
-function peerCount(node) {
-  let count = 0;
-
-  for (let peer = node.pool.peers.head(); peer; peer = peer.next) {
-    if (peer.ack)
-      count += 1;
-  }
-
-  return count;
-}
-
-function frame(framer, packet) {
-  return framer.packet(packet.type, packet.encode());
-}
-
-function version(nonce) {
-  return new packets.VersionPacket({
-    services: common.services.NETWORK,
-    nonce,
-    agent: '/hnsr-poc:0.0.1/',
-    height: 1,
-    noRelay: true
-  });
+  return `UNKNOWN_${value}`;
 }
 
 async function openNode(node, opened) {
@@ -126,265 +139,339 @@ async function openNode(node, opened) {
   node.startSync();
 }
 
+async function closeNode(node, opened) {
+  const index = opened.indexOf(node);
+
+  await node.close();
+
+  if (index !== -1)
+    opened.splice(index, 1);
+}
+
 async function main() {
   const artifact = process.argv[2] ? path.resolve(process.argv[2]) : null;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hsd-hnsr-regtest-'));
+  const base = 20000 + (process.pid % 1000) * 24;
   const identities = {
-    endpoint: secp256k1.privateKeyGenerate(),
-    relay: secp256k1.privateKeyGenerate(),
-    rendezvous: secp256k1.privateKeyGenerate(),
-    requester: secp256k1.privateKeyGenerate()
+    relays: [identity(), identity()],
+    rendezvous: [identity(), identity(), identity(), identity()],
+    endpoint: identity(),
+    requester: identity()
   };
-  const ports = {
-    relay: {p2p: 14428, brontide: 14438, http: 14448},
-    rendezvous: {p2p: 14429, brontide: 14439, http: 14449},
-    endpoint: {p2p: 14427, brontide: 14437, http: 14447},
-    requester: {p2p: 14426, brontide: 14436, http: 14446}
+  const nodePorts = {
+    relays: [ports(base, 0), ports(base, 1)],
+    rendezvous: [
+      ports(base, 2),
+      ports(base, 3),
+      ports(base, 4),
+      ports(base, 5)
+    ],
+    endpoint: ports(base, 6),
+    requester: ports(base, 7)
   };
   const opened = [];
+  const wireCounts = {};
+  const relayWirePayloads = new Map();
+  const nodes = [];
   let endpoint = null;
-  let relay = null;
-  let rendezvous = null;
   let requester = null;
 
   try {
-    relay = new FullNode(nodeOptions(
-      path.join(root, 'relay'),
-      identities.relay,
-      ports.relay,
-      {experimentalHnsrRelay: true}));
-    rendezvous = new FullNode(nodeOptions(
-      path.join(root, 'rendezvous'),
-      identities.rendezvous,
-      ports.rendezvous,
-      {experimentalHnsrRendezvous: true}));
+    const relays = identities.relays.map((key, index) => {
+      return new FullNode(nodeOptions(
+        path.join(root, `relay-${index}`),
+        key,
+        nodePorts.relays[index],
+        {experimentalHnsrRelay: true}));
+    });
+    const rendezvous = new Array(4);
 
-    await openNode(relay, opened);
-    await openNode(rendezvous, opened);
+    for (let index = 3; index >= 0; index--) {
+      const extra = {experimentalHnsrRendezvous: true};
 
-    const relayAddress = peerAddress(relay, ports.relay.brontide);
-    const rendezvousAddress = peerAddress(
-      rendezvous,
-      ports.rendezvous.brontide);
+      if (index < 3) {
+        extra.nodes = [nodeAddress(
+          identities.rendezvous[index + 1],
+          nodePorts.rendezvous[index + 1].brontide)];
+      }
+
+      rendezvous[index] = new FullNode(nodeOptions(
+        path.join(root, `rendezvous-${index}`),
+        identities.rendezvous[index],
+        nodePorts.rendezvous[index],
+        extra));
+    }
+
+    nodes.push(...relays, ...rendezvous);
+
+    for (const relay of relays)
+      await openNode(relay, opened);
+
+    for (let index = 3; index >= 0; index--)
+      await openNode(rendezvous[index], opened);
+
+    for (let index = 0; index < 3; index++) {
+      await waitFor(
+        () => findPeer(rendezvous[index], identities.rendezvous[index + 1]),
+        `Rendezvous link ${index}->${index + 1} did not authenticate.`);
+    }
+
+    const relayAddresses = identities.relays.map((key, index) => {
+      return nodeAddress(key, nodePorts.relays[index].brontide);
+    });
+    const rendezvousBootstrap = nodeAddress(
+      identities.rendezvous[0],
+      nodePorts.rendezvous[0].brontide);
 
     endpoint = new FullNode(nodeOptions(
       path.join(root, 'endpoint'),
       identities.endpoint,
-      ports.endpoint,
+      nodePorts.endpoint,
       {
         listen: false,
         experimentalHnsrEndpoint: true,
-        nodes: [relayAddress, rendezvousAddress]
+        nodes: [...relayAddresses, rendezvousBootstrap]
       }));
     requester = new FullNode(nodeOptions(
       path.join(root, 'requester'),
       identities.requester,
-      ports.requester,
-      {
-        listen: false,
-        nodes: [relayAddress, rendezvousAddress]
-      }));
+      nodePorts.requester,
+      {listen: false, nodes: [rendezvousBootstrap]}));
+    nodes.push(endpoint, requester);
 
     await openNode(endpoint, opened);
     await openNode(requester, opened);
 
-    await waitFor(
-      () => peerCount(endpoint) === 2 && peerCount(requester) === 2,
-      'Timed out waiting for the four-node HNSR topology.');
+    await waitFor(() => {
+      return identities.relays.every(key => findPeer(endpoint, key))
+        && findPeer(endpoint, identities.rendezvous[0])
+        && findPeer(requester, identities.rendezvous[0]);
+    }, 'Endpoint and requester bootstrap peers did not authenticate.');
 
-    const endpointRelay = findPeer(
-      endpoint,
-      common.EXPERIMENTAL_HNSR_RELAY_SERVICE);
-    const endpointRendezvous = findPeer(
-      endpoint,
-      common.EXPERIMENTAL_HNSR_RENDEZVOUS_SERVICE);
-    const requesterRelay = findPeer(
-      requester,
-      common.EXPERIMENTAL_HNSR_RELAY_SERVICE);
-    const requesterRendezvous = findPeer(
-      requester,
-      common.EXPERIMENTAL_HNSR_RENDEZVOUS_SERVICE);
-
-    assert(endpointRelay && endpointRendezvous);
-    assert(requesterRelay && requesterRendezvous);
-    assert(endpointRelay.address.key.equals(relay.hnsr.publicKey));
-    assert(requesterRelay.address.key.equals(relay.hnsr.publicKey));
-
-    for (const node of [endpoint, relay, rendezvous, requester])
+    for (const node of nodes) {
       node.chain.synced = true;
-
-    const coinbase = Address.fromProgram(0, Buffer.alloc(20, 0x01));
-    const block = await relay.miner.mineBlock(relay.chain.tip, coinbase);
-    await relay.chain.add(block);
-    relay.pool.announceBlock(block);
-    await waitFor(
-      () => [endpoint, relay, rendezvous, requester]
-        .every(node => node.chain.height === 1),
-      () => `Core regtest block did not propagate: ${[
-        endpoint,
-        relay,
-        rendezvous,
-        requester
-      ].map(node => node.chain.height).join(',')}.`);
-
-    const wireCounts = {};
-
-    for (const node of [endpoint, relay, rendezvous, requester]) {
+      relayWirePayloads.set(node, []);
       node.pool.on('packet', (packet) => {
         if (packet.type !== packets.types.EXPERIMENTAL_HNSR)
           return;
-        const name = Object.keys(opcodes)
-          .find(key => opcodes[key] === packet.opcode);
+
+        const name = opcodeName(packet.opcode);
         wireCounts[name] = (wireCounts[name] || 0) + 1;
+
+        if (node.hnsr.relay && packet.opcode === opcodes.DATA)
+          relayWirePayloads.get(node).push(Buffer.from(packet.body));
       });
     }
 
-    const ticket = await endpoint.hnsr.reserve(endpointRelay, {
+    const endpointRelays = identities.relays.map(
+      key => findPeer(endpoint, key));
+    const endpointRendezvous = findPeer(
+      endpoint,
+      identities.rendezvous[0]);
+    const requesterRendezvous = findPeer(
+      requester,
+      identities.rendezvous[0]);
+    const reservationOptions = {
       lifetime: 1800,
       maxCircuits: 4,
-      maxBytes: 1048576
-    });
-    const record = await endpoint.hnsr.publish(
+      maxBytes: 8 * 1024 * 1024
+    };
+    const initialTickets = await Promise.all(endpointRelays.map((peer) => {
+      return endpoint.hnsr.reserve(peer, reservationOptions);
+    }));
+    const publication = await endpoint.hnsr.publishReplicated(
       endpointRendezvous,
-      [ticket],
-      {lifetime: 900});
-    const key = routeKey(
-      endpoint.network.magic,
-      endpoint.hnsr.publicKey);
-    const routes = await requester.hnsr.lookup(
+      initialTickets,
+      {lifetime: 900, replicas: 4, minimumStores: 4});
+    const key = routeKey(endpoint.network.magic, endpoint.hnsr.publicKey);
+
+    assert.strictEqual(publication.stored.length, 4);
+    assert(rendezvous.every(node => node.hnsr.store.size === 1));
+    assert(endpoint.hnsr.contacts.size >= 4);
+
+    const sampled = await requester.hnsr.sampleRoutes(
       requesterRendezvous,
-      key);
-
-    assert.strictEqual(routes.length, 1);
-    assert(routes[0].verify(requester.network.magic));
-    assert(routes[0].tickets[0].id().equals(ticket.id()));
-
-    const endpointParser = new Parser('regtest');
-    const requesterParser = new Parser('regtest');
-    const framer = new Framer('regtest');
-    const requesterNonce = random.randomBytes(8);
-    const endpointNonce = random.randomBytes(8);
-    const pingNonce = random.randomBytes(8);
-    let endpointInner = null;
-    let requesterInner = null;
-    let endpointSawVersion = false;
-    let endpointSawVerack = false;
-    let requesterSawVersion = false;
-    let requesterSawVerack = false;
-    let requesterSawPong = false;
-
-    endpointParser.on('error', (err) => {
-      throw err;
-    });
-    requesterParser.on('error', (err) => {
-      throw err;
-    });
-    endpointParser.on('packet', (packet) => {
-      if (packet.type === packets.types.VERSION) {
-        endpointSawVersion = packet.agent === '/hnsr-poc:0.0.1/';
-        endpointInner.write(frame(framer, version(endpointNonce)));
-        endpointInner.write(frame(framer, new packets.VerackPacket()));
-      } else if (packet.type === packets.types.VERACK) {
-        endpointSawVerack = true;
-      } else if (packet.type === packets.types.PING) {
-        endpointInner.write(frame(
-          framer,
-          new packets.PongPacket(packet.nonce)));
-      }
-    });
-    requesterParser.on('packet', (packet) => {
-      if (packet.type === packets.types.VERSION) {
-        requesterSawVersion = packet.agent === '/hnsr-poc:0.0.1/';
-        requesterInner.write(frame(framer, new packets.VerackPacket()));
-      } else if (packet.type === packets.types.VERACK) {
-        requesterSawVerack = true;
-      } else if (packet.type === packets.types.PONG) {
-        requesterSawPong = packet.nonce.equals(pingNonce);
-      }
+      8);
+    const sampledRoute = sampled.records.find((record) => {
+      return record.routeKey.equals(key);
     });
 
-    endpoint.hnsr.once('circuit', (socket) => {
-      socket.on('error', (err) => {
-        throw err;
-      });
-      endpointInner = BrontideStream.fromInbound(
-        socket,
-        endpoint.identityKey);
-      endpointInner.on('error', (err) => {
-        throw err;
-      });
-      endpointInner.on('data', data => endpointParser.feed(data));
-    });
+    assert(sampledRoute);
+    assert(sampledRoute.verify(requester.network.magic));
+    assert(requester.hnsr.contacts.size >= 4);
+    const endpointKnownRendezvous = endpoint.hnsr.contacts.size;
 
-    const circuit = await requester.hnsr.openCircuit(
-      requesterRelay,
-      routes[0].tickets[0]);
-    circuit.socket.on('error', (err) => {
-      throw err;
-    });
-    requesterInner = BrontideStream.fromOutbound(
-      circuit.socket,
-      requester.identityKey,
-      routes[0].delegation.endpointKey);
-    requesterInner.on('error', (err) => {
-      throw err;
-    });
-    requesterInner.on('data', data => requesterParser.feed(data));
+    const renewedTickets = await Promise.all(endpointRelays.map(
+      (peer, index) => endpoint.hnsr.renew(
+        peer,
+        initialTickets[index],
+        reservationOptions)));
+    const refreshed = await endpoint.hnsr.republish(
+      publication,
+      renewedTickets,
+      endpointRendezvous,
+      {lifetime: 900, replicas: 4, minimumStores: 4});
 
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error('Inner Brontide handshake timed out.')),
-        10000);
-      requesterInner.once('connect', () => {
-        clearTimeout(timer);
-        requesterInner.write(frame(framer, version(requesterNonce)));
-        resolve();
-      });
-    });
-
-    await waitFor(
-      () => endpointSawVersion
-        && endpointSawVerack
-        && requesterSawVersion
-        && requesterSawVerack,
-      'Inner Handshake version/verack exchange did not complete.');
-
-    requesterInner.write(frame(framer, new packets.PingPacket(pingNonce)));
-    await waitFor(
-      () => requesterSawPong,
-      'Inner Handshake ping/pong did not complete.');
-
-    assert(endpointInner.remoteStatic.equals(
-      secp256k1.publicKeyCreate(requester.identityKey, true)));
-    assert(requesterInner.remoteStatic.equals(endpoint.hnsr.publicKey));
     assert.strictEqual(
-      relay.hnsr.relayPayloads.some(raw => raw.includes(pingNonce)),
+      refreshed.record.sequence,
+      publication.record.sequence + 1);
+    assert.strictEqual(
+      refreshed.record.delegation.sequence,
+      publication.record.delegation.sequence + 1);
+    assert.strictEqual(refreshed.stored.length, 4);
+
+    await Promise.all(endpointRelays.map((peer, index) => {
+      return endpoint.hnsr.withdraw(peer, initialTickets[index]);
+    }));
+    assert(relays.every(node => node.hnsr.reservations.size === 1));
+
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const admission = await Promise.allSettled(new Array(72).fill(null).map(
+      () => requester.hnsr.lookup(requesterRendezvous, key, 1)));
+    const admitted = admission.filter(item => item.status === 'fulfilled');
+    const rateLimited = admission.filter((item) => {
+      return item.status === 'rejected' && item.reason.code === 14;
+    });
+
+    assert(admitted.length > 0);
+    assert(rateLimited.length > 0);
+
+    await closeNode(rendezvous[3], opened);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+
+    const replicatedLookup = await requester.hnsr.lookupReplicated(
+      requesterRendezvous,
+      key,
+      8,
+      {replicas: 4});
+
+    assert.strictEqual(replicatedLookup.records.length, 1);
+    assert.strictEqual(
+      replicatedLookup.records[0].sequence,
+      refreshed.record.sequence);
+    assert(replicatedLookup.queried.length >= 3);
+    assert(replicatedLookup.queried.length < 5);
+
+    await closeNode(relays[0], opened);
+
+    const endpointVirtualPromise = waitEvent(endpoint.hnsr, 'virtual peer');
+    const openedRoute = await requester.hnsr.openPeer(
+      replicatedLookup.records[0]);
+    const [endpointVirtual] = await endpointVirtualPromise;
+    const requesterVirtual = openedRoute.peer;
+
+    await waitFor(
+      () => endpointVirtual.handshake && requesterVirtual.handshake,
+      'Inner HNSR full-node peers did not complete version/verack.');
+    assert(openedRoute.ticket.relayKey.equals(relays[1].hnsr.publicKey));
+    assert.strictEqual(openedRoute.failures.length, 1);
+    assert(requesterVirtual.brontide.remoteStatic.equals(
+      endpoint.hnsr.publicKey));
+    assert(endpointVirtual.brontide.remoteStatic.equals(
+      requester.hnsr.publicKey));
+
+    const relay = relays[1];
+    const payloadStart = relayWirePayloads.get(relay).length;
+    const loadPackets = process.env.HNSR_LOAD_PACKETS
+      ? Number(process.env.HNSR_LOAD_PACKETS)
+      : 1000;
+
+    assert(Number.isSafeInteger(loadPackets) && loadPackets >= 0);
+
+    for (let i = 0; i < loadPackets; i++) {
+      const nonce = Buffer.allocUnsafe(8);
+      nonce.writeUInt32LE(i, 0);
+      nonce.writeUInt32LE(i ^ 0x5a5a5a5a, 4);
+      requesterVirtual.send(new packets.PingPacket(nonce));
+    }
+
+    const controlUnderLoadStarted = Date.now();
+    const loadTicketPromise = endpoint.hnsr.reserve(
+      endpointRelays[1],
+      reservationOptions);
+
+    const coinbase = Address.fromProgram(0, Buffer.alloc(20, 0x01));
+    const block = await endpoint.miner.mineBlock(endpoint.chain.tip, coinbase);
+    const blockHash = block.hash();
+
+    for (let peer = endpoint.pool.peers.head(); peer; peer = peer.next) {
+      if (!peer.hnsrVirtual)
+        peer.invFilter.add(blockHash);
+    }
+
+    for (let peer = requester.pool.peers.head(); peer; peer = peer.next) {
+      if (!peer.hnsrVirtual)
+        peer.invFilter.add(blockHash);
+    }
+
+    const propagationStarted = Date.now();
+    await endpoint.chain.add(block);
+    await waitFor(
+      () => requester.chain.height === 1,
+      () => {
+        return 'Inner block did not converge ('
+          + `requester=${requester.chain.height}).`;
+      },
+      30000);
+    const blockLatency = Date.now() - propagationStarted;
+    const loadTicket = await loadTicketPromise;
+    const controlUnderLoadLatency = Date.now() - controlUnderLoadStarted;
+    await endpoint.hnsr.withdraw(endpointRelays[1], loadTicket);
+
+    await waitFor(
+      () => relay.hnsr.relayQueueBytes === 0,
+      'Relay scheduler did not drain after saturation.',
+      30000);
+    await requesterVirtual.drain();
+
+    assert.strictEqual(endpoint.chain.height, 1);
+    assert.strictEqual(requester.chain.height, 1);
+    assert(relays.every(node => node.chain.height === 0));
+    assert(rendezvous.every(node => node.chain.height === 0));
+    assert(relay.hnsr.relayFrames > loadPackets);
+    assert(relay.hnsr.relayFlushes > 1);
+    assert(relay.hnsr.maxRelayQueuedBytes > common.hnsr.RELAY_BURST);
+    assert(relay.hnsr.maxRelayQueuedBytes
+      <= common.hnsr.MAX_CIRCUIT_QUEUE);
+    assert.strictEqual(relay.hnsr.relayDrops, 0);
+    const controlNodeHeights = [...relays, ...rendezvous]
+      .map(node => node.chain.height);
+
+    assert(controlNodeHeights.every(height => height === 0));
+
+    assert.strictEqual(relay.hnsr.reservations.size, 1);
+    assert.strictEqual(
+      relayWirePayloads.get(relay).slice(payloadStart)
+        .some(raw => raw.includes(blockHash)),
       false);
 
-    await endpoint.close();
-    opened.splice(opened.indexOf(endpoint), 1);
+    await closeNode(endpoint, opened);
     await waitFor(
       () => relay.hnsr.reservations.size === 0,
       'Relay did not invalidate the disconnected endpoint reservation.');
 
-    const staleRoutes = await requester.hnsr.lookup(
+    const staleLookup = await requester.hnsr.lookupReplicated(
       requesterRendezvous,
-      key);
-    assert.strictEqual(staleRoutes.length, 1);
+      key,
+      8,
+      {replicas: 4});
     let staleRejected = false;
 
     try {
-      await requester.hnsr.openCircuit(
-        requesterRelay,
-        staleRoutes[0].tickets[0]);
+      await requester.hnsr.openRoute(staleLookup.records[0]);
     } catch (e) {
-      staleRejected = e.code === 11;
+      staleRejected = Array.isArray(e.failures)
+        && e.failures.some(item => item.error.code === 11);
     }
 
     assert(staleRejected);
 
+    const activeRendezvous = rendezvous.slice(0, 3);
+    const transcript = relayWirePayloads.get(relay).length > 0
+      ? Buffer.concat(relayWirePayloads.get(relay))
+      : Buffer.alloc(0);
     const result = {
-      schema: 1,
+      schema: 2,
       network: 'regtest',
       assignment: {
         rendezvousServiceBit:
@@ -394,57 +481,85 @@ async function main() {
         packetType: `0x${common.EXPERIMENTAL_HNSR.toString(16)}`
       },
       topology: {
-        fullNodes: 4,
-        outerTransport: 'authenticated Handshake Brontide',
+        fullNodes: 8,
+        relays: 2,
+        rendezvousNodes: 4,
         endpointListeners: 0,
-        convergedRegtestHeight: 1,
-        endpoint: endpoint.hnsr.publicKey.toString('hex'),
-        relay: relay.hnsr.publicKey.toString('hex'),
-        rendezvous: rendezvous.hnsr.publicKey.toString('hex'),
-        requester: requester.hnsr.publicKey.toString('hex')
+        outerTransport: 'authenticated Handshake Brontide',
+        innerTransport: 'end-to-end authenticated Handshake Brontide'
       },
-      reservation: {
-        relaySignatureVerified: ticket.verifyRelay(),
-        endpointSignatureVerified: ticket.verifyEndpoint(),
-        ticketID: ticket.id().toString('hex'),
-        maxActiveCircuits: ticket.maxActiveCircuits,
-        maxBytesPerCircuit: ticket.maxBytesPerCircuit
+      discovery: {
+        bootstrapRendezvous: 1,
+        endpointKnownRendezvous,
+        requesterKnownRendezvous: requester.hnsr.contacts.size,
+        sampledRecords: sampled.records.length,
+        sampledEndpointFound: Boolean(sampledRoute),
+        iterativeLookupLiveNodes: replicatedLookup.queried.length
       },
-      rendezvous: {
-        routeKey: key.toString('hex'),
-        routeBytes: record.encode().length,
-        routeSignatureVerified: record.verify(endpoint.network.magic),
-        returnedRecords: routes.length,
-        storedCopiesInTrial: rendezvous.hnsr.store.size
-      },
-      circuit: {
-        profile: 'HNS_NODE_V1',
-        circuitID: circuit.circuitID.toString('hex'),
-        innerTransport: 'end-to-end Handshake Brontide',
-        endpointAuthenticated: requesterInner.remoteStatic.equals(
-          endpoint.hnsr.publicKey),
-        requesterAuthenticated: endpointInner.remoteStatic.equals(
-          requester.hnsr.publicKey),
-        versionVerack: true,
-        pingPong: true
-      },
-      relayView: {
-        forwardedEncryptedBytes: relay.hnsr.relayBytes,
-        plaintextPingNonceObserved: relay.hnsr.relayPayloads
-          .some(raw => raw.includes(pingNonce)),
-        transcriptSHA256: sha256.digest(Buffer.concat(
-          relay.hnsr.relayPayloads)).toString('hex')
+      replication: {
+        requestedCopies: 4,
+        initialStoredCopies: publication.stored.length,
+        refreshedStoredCopies: refreshed.stored.length,
+        survivingStores: activeRendezvous.map(node => node.hnsr.store.size),
+        rendezvousFailureRecovered: replicatedLookup.records.length === 1
       },
       lifecycle: {
-        staleRouteStillReturned: staleRoutes.length === 1,
+        initialSequence: publication.record.sequence,
+        refreshedSequence: refreshed.record.sequence,
+        renewedTickets: renewedTickets.length,
+        oldTicketsWithdrawn: initialTickets.length,
+        staleRouteStillReturned: staleLookup.records.length === 1,
         disconnectedReservationInvalidated:
           relay.hnsr.reservations.size === 0,
         staleTicketRejected: staleRejected
       },
+      failover: {
+        firstRelayStopped: true,
+        failedCandidates: openedRoute.failures.length,
+        selectedRelay: openedRoute.ticket.relayKey.toString('hex'),
+        selectedSecondRelay: openedRoute.ticket.relayKey.equals(
+          relays[1].hnsr.publicKey)
+      },
+      innerPeer: {
+        profile: 'HNS_NODE_V1',
+        actualHsdPeerObjects: true,
+        versionVerack: requesterVirtual.handshake && endpointVirtual.handshake,
+        endpointAuthenticated: requesterVirtual.brontide.remoteStatic.equals(
+          endpoint.hnsr.publicKey),
+        requesterAuthenticated: endpointVirtual.brontide.remoteStatic.equals(
+          requester.hnsr.publicKey)
+      },
+      blockTraffic: {
+        hash: blockHash.toString('hex'),
+        endpointHeight: 1,
+        requesterHeight: requester.chain.height,
+        controlNodeHeights,
+        deliveredOnlyByInnerPeer: controlNodeHeights
+          .every(height => height === 0),
+        latencyMs: blockLatency
+      },
+      saturation: {
+        pingPackets: loadPackets,
+        relayFrames: relay.hnsr.relayFrames,
+        relayBytes: relay.hnsr.relayBytes,
+        schedulerFlushes: relay.hnsr.relayFlushes,
+        maximumQueuedBytes: relay.hnsr.maxRelayQueuedBytes,
+        queueLimitBytes: common.hnsr.MAX_CIRCUIT_QUEUE,
+        relayDrops: relay.hnsr.relayDrops,
+        controlReservationLatencyMs: controlUnderLoadLatency,
+        admissionRequests: admission.length,
+        admissionAccepted: admitted.length,
+        admissionRateLimited: rateLimited.length
+      },
+      relayView: {
+        plaintextBlockHashObserved: relayWirePayloads.get(relay)
+          .some(raw => raw.includes(blockHash)),
+        transcriptSHA256: sha256.digest(transcript).toString('hex')
+      },
       observedOpcodes: wireCounts,
       result: 'pass'
     };
-    const output = JSON.stringify(result, null, 2) + '\n';
+    const output = `${JSON.stringify(result, null, 2)}\n`;
 
     if (artifact) {
       fs.mkdirSync(path.dirname(artifact), {recursive: true});

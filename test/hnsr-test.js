@@ -12,6 +12,11 @@ const {
   EndpointDelegation,
   RouteRecord,
   RouteStore,
+  RendezvousContact,
+  CircuitSocket,
+  rendezvousNodeID,
+  compareDistance,
+  opcodes,
   routeKey
 } = require('../lib/net/hnsr');
 
@@ -219,6 +224,118 @@ describe('HNSR', function() {
       store.get(item.key, 16, item.record.expiresAt).length,
       0);
     assert.strictEqual(store.size, 0);
+  });
+
+  it('should encode authenticated rendezvous contacts and XOR order', () => {
+    const privateKey = secp256k1.privateKeyGenerate();
+    const peerKey = secp256k1.publicKeyCreate(privateKey, true);
+    const timestamp = 1700000000;
+    const contact = new RendezvousContact({
+      nodeID: rendezvousNodeID(network.magic, peerKey),
+      hostType: 1,
+      host: Buffer.from('00000000000000000000ffff7f000001', 'hex'),
+      port: network.brontidePort,
+      services: common.services.NETWORK
+        | common.EXPERIMENTAL_HNSR_RENDEZVOUS_SERVICE,
+      peerKey,
+      observedAt: timestamp
+    });
+    const decoded = RendezvousContact.decode(contact.encode());
+
+    assert.strictEqual(contact.encode().length, 100);
+    assert(decoded.verify(network.magic, timestamp));
+    assert(decoded.peerKey.equals(peerKey));
+    assert.strictEqual(decoded.toAddress(network).host, '127.0.0.1');
+    assert.strictEqual(decoded.toAddress(network).port, network.brontidePort);
+
+    const target = Buffer.alloc(32);
+    const near = Buffer.alloc(32);
+    const far = Buffer.alloc(32);
+    near[0] = 1;
+    far[0] = 2;
+    assert(compareDistance(near, far, target) < 0);
+    assert(compareDistance(far, near, target) > 0);
+  });
+
+  it('should sample deterministically and enforce source quotas', () => {
+    const timestamp = 1700000000;
+    const first = fixture(timestamp, 1);
+    const second = fixture(timestamp, 1);
+    const store = new RouteStore(network.magic, {
+      maxRecords: 4,
+      maxPerKey: 2,
+      maxPerPeer: 1
+    });
+
+    store.put(first.key, first.record.encode(), timestamp, 'peer-a');
+    assert.throws(() => {
+      store.put(second.key, second.record.encode(), timestamp, 'peer-a');
+    }, /per-peer route capacity/);
+    store.put(second.key, second.record.encode(), timestamp, 'peer-b');
+
+    const seed = Buffer.alloc(32, 0x11);
+    const sample = store.sample(2, seed, timestamp);
+    const repeated = store.sample(2, seed, timestamp);
+
+    assert.strictEqual(sample.length, 2);
+    assert.bufferEqual(sample[0], repeated[0]);
+    assert.bufferEqual(sample[1], repeated[1]);
+
+    first.record.sequence = 2;
+    first.record.sign(first.endpointPrivate);
+    assert.throws(() => {
+      store.put(first.key, first.record.encode(), timestamp, 'peer-b');
+    }, /per-peer route capacity/);
+
+    const retained = RouteRecord.decode(store.get(
+      first.key,
+      1,
+      timestamp)[0]);
+    assert.strictEqual(retained.sequence, 1);
+  });
+
+  it('should apply circuit backpressure and delayed window credit', async () => {
+    const sent = [];
+    const service = {
+      _send(peer, opcode, contextID, body) {
+        sent.push({peer, opcode, contextID, body});
+        return true;
+      },
+      _dropSocket() {}
+    };
+    const peer = {id: 1};
+    const contextID = Buffer.from('0102030405060708', 'hex');
+    const socket = new CircuitSocket(
+      service,
+      peer,
+      contextID,
+      common.hnsr.MIN_WINDOW);
+    const payload = Buffer.alloc(common.hnsr.MIN_WINDOW + 10, 0x22);
+
+    assert.strictEqual(socket.write(payload), false);
+    assert.strictEqual(sent.length, 1);
+    assert.strictEqual(sent[0].opcode, opcodes.DATA);
+    assert.strictEqual(sent[0].body.length, common.hnsr.MIN_WINDOW);
+    assert.strictEqual(socket.sendQueueBytes, 10);
+
+    const drained = new Promise(resolve => socket.once('drain', resolve));
+    socket.addCredit(10);
+    await drained;
+    assert.strictEqual(socket.sendQueueBytes, 0);
+    assert.strictEqual(sent[1].body.length, 10);
+
+    let received = null;
+    socket.on('data', (data) => {
+      received = data;
+    });
+    socket.pause();
+    socket.receive(Buffer.from('aabb', 'hex'));
+    assert.strictEqual(received, null);
+    assert.strictEqual(sent.length, 2);
+    socket.resume();
+    assert.bufferEqual(received, Buffer.from('aabb', 'hex'));
+    assert.strictEqual(sent[2].opcode, opcodes.WINDOW);
+    assert.strictEqual(sent[2].body.readUInt32LE(0), 2);
   });
 
   it('should expose role bits only for configured regtest roles', () => {
