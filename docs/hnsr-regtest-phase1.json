@@ -45,7 +45,7 @@
   "failover": {
     "firstRelayStopped": true,
     "failedCandidates": 1,
-    "selectedRelay": "03ed129c6047c975cf65fc0eb651011dc58d4f5ae4e5e693b3d769fd6c61ee073d",
+    "selectedRelay": "03664a4d9746167b043a17cd9b9f2211f92ef37992b2025cc3d4570b302150d94a",
     "selectedSecondRelay": true
   },
   "innerPeer": {
@@ -56,7 +56,7 @@
     "requesterAuthenticated": true
   },
   "blockTraffic": {
-    "hash": "201a270ec8583222dc56533994e6dc591ae4d462167f5273ca494deb6c2b1311",
+    "hash": "6d2615113467bbee7a6ed2215e28b81f2e0210a2a383b5854fd2105d086cdb9e",
     "endpointHeight": 1,
     "requesterHeight": 1,
     "controlNodeHeights": [
@@ -68,24 +68,24 @@
       0
     ],
     "deliveredOnlyByInnerPeer": true,
-    "latencyMs": 8353
+    "latencyMs": 3020
   },
   "saturation": {
     "pingPackets": 1000,
     "relayFrames": 8043,
     "relayBytes": 107461,
-    "schedulerFlushes": 16,
-    "maximumQueuedBytes": 53000,
+    "schedulerFlushes": 17,
+    "maximumQueuedBytes": 44129,
     "queueLimitBytes": 65536,
     "relayDrops": 0,
-    "controlReservationLatencyMs": 9212,
+    "controlReservationLatencyMs": 3082,
     "admissionRequests": 72,
     "admissionAccepted": 64,
     "admissionRateLimited": 8
   },
   "relayView": {
     "plaintextBlockHashObserved": false,
-    "transcriptSHA256": "3eb75db41d0c41281b93f670657db621b3a4f24b090f7188a12d9f2556a3a5a9"
+    "transcriptSHA256": "36257106017f1ef8693af71b67fa59bc568bfefb6a32dc09fcee745b42641712"
   },
   "observedOpcodes": {
     "RESERVE": 3,
