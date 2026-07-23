@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "network": "regtest",
+  "phase": 2,
+  "topology": {
+    "independentlyKeyedProcesses": 12,
+    "relayOperators": 2,
+    "rendezvousOperators": 8,
+    "endpointOperators": 1,
+    "requesterOperators": 1,
+    "distinctPersistentPrefixes": 12,
+    "androidBootstrap": "127.0.0.1:30568"
+  },
+  "routing": {
+    "bucketSize": 16,
+    "maximumContacts": 2048,
+    "initialContacts": 8,
+    "peerDialBudget": 8,
+    "restartedNodeRecoveredContacts": 1
+  },
+  "replication": {
+    "requestedCopies": 8,
+    "initialStoredCopies": 8,
+    "restartedNodeRecoveredRoutes": 1,
+    "stoppedRendezvous": [
+      1,
+      3,
+      5
+    ],
+    "preChurnLookupNodes": 8,
+    "liveCopiesAfterChurn": 5,
+    "lookupLiveNodes": 5,
+    "latestSequence": 2
+  },
+  "lifecycle": {
+    "networkChangeTriggeredRepublish": true,
+    "republishAttempts": 1,
+    "deadRelayFailedOver": true,
+    "selectedRelay": "03a78d3fd20b960f06b477d2edf76d27b4c846b1c9dbc683345b61e784472d1d69"
+  },
+  "limits": {
+    "requesterCircuitLimit": 8,
+    "circuitCapacityRejected": true,
+    "nodeRelayBytesPerSecond": 4194304,
+    "webRelayBytesPerSecond": 1048576,
+    "routeSpamAccepted": 29,
+    "routeSpamRejected": 11,
+    "ddosRequests": 160,
+    "ddosAccepted": 64,
+    "ddosRateLimited": 96
+  },
+  "priorityTraffic": {
+    "saturatedProfile": "HNS_WEB_V1",
+    "propagatedProfile": "HNS_NODE_V1",
+    "actualInnerBlock": "0ffcd1674f3f27b44b7c621e0b44b673a9b6676d135c5a2a0aba47a71165dde8",
+    "blockLatencyMs": 80,
+    "maximumQueuedBytes": 49325,
+    "relayDrops": 0
+  },
+  "telemetry": {
+    "relay": {
+      "contacts": 0,
+      "storedRoutes": 0,
+      "activeReservations": 2,
+      "activeCircuits": 1,
+      "trackedRelays": 0,
+      "queuedBytes": 0,
+      "queuedNodeBytes": 0,
+      "queuedWebBytes": 0,
+      "relayBytes": 1052795,
+      "relayFrames": 310,
+      "relayDrops": 0,
+      "admissionRejected": 0,
+      "verificationChecks": 0,
+      "verificationRejected": 0,
+      "circuitRejected": 1,
+      "republishAttempts": 0,
+      "republishSuccesses": 0,
+      "republishFailures": 0
+    },
+    "rendezvous": {
+      "contacts": 1,
+      "storedRoutes": 30,
+      "activeReservations": 0,
+      "activeCircuits": 0,
+      "trackedRelays": 0,
+      "queuedBytes": 0,
+      "queuedNodeBytes": 0,
+      "queuedWebBytes": 0,
+      "relayBytes": 0,
+      "relayFrames": 0,
+      "relayDrops": 0,
+      "admissionRejected": 106,
+      "verificationChecks": 128,
+      "verificationRejected": 4,
+      "circuitRejected": 0,
+      "republishAttempts": 0,
+      "republishSuccesses": 0,
+      "republishFailures": 0
+    },
+    "endpoint": {
+      "contacts": 8,
+      "storedRoutes": 0,
+      "activeReservations": 0,
+      "activeCircuits": 0,
+      "trackedRelays": 0,
+      "queuedBytes": 0,
+      "queuedNodeBytes": 0,
+      "queuedWebBytes": 0,
+      "relayBytes": 0,
+      "relayFrames": 0,
+      "relayDrops": 0,
+      "admissionRejected": 0,
+      "verificationChecks": 0,
+      "verificationRejected": 0,
+      "circuitRejected": 0,
+      "republishAttempts": 1,
+      "republishSuccesses": 1,
+      "republishFailures": 0
+    }
+  },
+  "result": "pass"
+}

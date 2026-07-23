@@ -1,8 +1,9 @@
 # Experimental HNSR proof of concept
 
-This branch contains a deliberately bounded, regtest-only implementation of
-the Phase 1 `HNS_NODE_V1` and `HNS_WEB_V1` paths from the draft **Handshake P2P
-Rendezvous and Authenticated Service Relay** HIP.
+This branch contains a deliberately bounded implementation of the Phase 1 and
+Phase 2 `HNS_NODE_V1` and `HNS_WEB_V1` paths from the draft **Handshake P2P
+Rendezvous and Authenticated Service Relay** HIP. Regtest remains the default;
+testnet use requires a second explicit acknowledgement and public addresses.
 
 It is reference code for exercising the wire shape, authorization boundaries,
 and lifecycle on actual `hsd` peers. It is not a production relay, a permanent
@@ -16,9 +17,11 @@ wire assignment, or a claim that every phase of the draft HIP is implemented.
 | HNSR relay service | `0x08000000` |
 | HNSR packet type | `0xf3` |
 
-The roles cannot be enabled outside regtest. Nodes on other networks do not
-advertise either bit. These values are collision-prone experimental values and
-must be replaced if the protocol receives assigned values.
+The roles cannot be enabled on mainnet. Testnet nodes do not advertise either
+bit unless both HNSR and `--experimental-hnsr-testnet` are set, and relay or
+rendezvous roles also require a publicly routable advertised host. These
+values are collision-prone experimental values and must be replaced if the
+protocol receives assigned values.
 
 ## Implemented trial profiles
 
@@ -26,7 +29,8 @@ The branch implements:
 
 - the version-1 HNSR envelope and all 21 reserved opcode numbers;
 - strict envelope length, flag, version, opcode, and context checks;
-- regtest-only role advertisement;
+- regtest role advertisement, plus explicitly acknowledged testnet role
+  advertisement under the public-address gate;
 - iterative `FINDNODE` / `NODES` discovery with XOR ordering, parallelism of
   three, a 32-query bound, authenticated rendezvous contacts, and connections
   to newly discovered Handshake peers;
@@ -41,17 +45,19 @@ The branch implements:
   digests;
 - self-authorized unnamed endpoint delegations and route records for
   `HNS_NODE_V1`;
-- bounded, expiring, sequence-aware in-memory route storage with global,
-  per-key, and per-publishing-peer limits;
+- bounded, expiring, sequence-aware route storage with optional atomic disk
+  persistence and global, per-key, per-peer, and per-prefix limits;
 - `PUTROUTE` / `PUTRESULT` and exact-key `GETROUTE` / `ROUTES`;
-- multi-relay records, renewed-record republishing, sequential relay failover,
-  and failure reporting;
+- multi-relay records, renewed-record republishing, scored relay failover,
+  timer-driven refresh before one-third lifetime remains, immediate
+  network-change refresh, and failure reporting;
 - `OPEN` / `INCOMING` / `ACCEPT` / `OPENED` circuit establishment;
 - opaque `DATA`, directional `WINDOW`, and `CLOSE` forwarding;
 - per-ticket circuit and byte limits, bounded frames, and relay-side
   directional credit enforcement;
-- bounded relay queues with burst-yield scheduling, control-request admission,
-  request-byte limits, and observable queue/drop counters;
+- separate bounded node and web relay budgets with 3:1 weighted service,
+  burst-yield scheduling, control-request admission, request, byte,
+  verification, prefix, and circuit limits, and telemetry snapshots;
 - immediate local reservation invalidation when the endpoint peer disconnects;
   and
 - actual inbound and outbound `Peer` objects in the ordinary HSD pool, running
@@ -70,6 +76,11 @@ The branch implements:
 - stable origin derivation from `(hnsr, name_hash, service_name, profile_id)`,
   independent of relay, ticket, and endpoint rotation; and
 - sequential named-endpoint and per-record relay failover.
+
+Phase 2 additionally supplies 256 persistent XOR buckets (`k = 16`), a 2,048
+contact cap, public-address and netgroup admission, failure-based eviction,
+an eight-dial discovery budget, eight-copy publication with netgroup-aware
+selection, durable restart recovery, and a bounded admission-prefix table.
 
 The proof-of-concept handler does not forward to a requester-selected host or
 port. A circuit can terminate only at the exact live peer connection bound to
@@ -94,9 +105,9 @@ The branch completes the directly executable unnamed `HNS_NODE_V1` slice:
 - real inner full-node block traffic; and
 - flow-control, scheduler saturation, control admission, and zero-drop checks.
 
-The rendezvous table is intentionally the bounded live/recently-connected
-contact set for this regtest phase. It exercises iterative XOR routing but is
-not yet the persistent bucket implementation required for a public network.
+The original four-node trial remains as Phase 1 regression coverage. Phase 2
+replaces its flat contact set with persistent XOR buckets without changing the
+Phase 1 wire format.
 
 ### Phase 1B: named-service regtest implemented here
 
@@ -117,15 +128,33 @@ browser enforcement remains a Phase 3 client-integration requirement.
 
 ### Phase 2: bounded testnet hardening
 
-Still required before any testnet experiment:
+Implemented and reproducible on regtest:
 
-- persistent routing buckets and optional durable route storage;
-- eight-replica, multi-path churn tests over larger and adversarial topologies;
-- public-address admission, routability, per-prefix, and netgroup policy;
-- peer-dial budgets, topology scoring, republish/failover timers, and restart
-  recovery; and
-- scheduler integration that explicitly prioritizes blocks, headers, proofs,
-  and transaction traffic, plus operational telemetry.
+- persistent XOR routing buckets and durable route storage with restart
+  recovery;
+- eight-copy replication, diversity selection, larger-topology discovery, and
+  recovery after three rendezvous failures;
+- public-address, per-prefix, netgroup, dial, verification, store, requester,
+  endpoint, profile, and global admission bounds;
+- scored multi-relay failover and scheduled or network-triggered republishing;
+- separate node/web relay queues and byte budgets, with ordinary HSD core
+  traffic outside the HNSR queues;
+- a 160-request DDoS exercise, valid signed route spam, circuit saturation,
+  and operational telemetry; and
+- an actual inner block propagated while a 1 MiB `HNS_WEB_V1` stream saturates
+  the same relay.
+
+The companion native Android test build opens the HNSR connection in Rust,
+registers an Android default-network callback, invalidates stale probe
+generations, and reconnects after loss and restoration. The checked-in device
+screenshot records three successful native probes and complete verification of
+the refreshed two-relay record.
+
+Still required before calling Phase 2 a real testnet deployment is an external
+run across several independently administered machines and networks, followed
+by a sustained soak and operator review. The local trial uses distinct keys,
+processes, and persistent prefixes to make that exercise directly runnable; it
+does not pretend that one workstation represents independent operators.
 
 ### Phase 3: node, mobile, and browser integration
 
@@ -133,7 +162,8 @@ Still required for user-facing adoption:
 
 - RPCs and configuration/status APIs;
 - address-manager, wallet, and SPV discovery integration;
-- Android foreground/background lifecycle and network-change handling;
+- production Android foreground/background, metered-network, battery, and
+  thermal policy beyond the native network-change diagnostic;
 - HNS-aware browser navigation and named-origin behavior; and
 - operator documentation, compatibility behavior, and upgrade UX.
 
@@ -154,6 +184,8 @@ NODE_BACKEND=js npm run test-file -- \
   test/hnsr-test.js test/brontide-test.js test/net-test.js
 NODE_BACKEND=js node scripts/run-hnsr-regtest-trial.js \
   docs/hnsr-regtest-phase1.json
+NODE_BACKEND=js node scripts/run-hnsr-phase2-trial.js \
+  docs/hnsr-regtest-phase2.json
 ```
 
 `NODE_BACKEND=js` selects bcrypto's portable JavaScript backend and is not a
@@ -207,6 +239,15 @@ topology, discovery, replica survival, lifecycle transitions, selected relay,
 block-only inner convergence, saturation counters, admission results, opcode
 counts, and a ciphertext transcript hash. Random values change on every run.
 
+The Phase 2 trial starts 12 independently keyed FullNodes with two relays and
+eight rendezvous nodes. It verifies eight initial stores, durable contact and
+route recovery, five surviving stores after three failures, immediate
+network-change republishing, dead-relay failover, the requester circuit cap,
+verification-budget route-spam rejection, 160-request rate limiting, and a
+real block over `HNS_NODE_V1` during web-profile saturation. One checked-in run
+is in `docs/hnsr-regtest-phase2.json`; the matching Pixel 9 native evidence is
+`docs/hnsr-phase2-android.png`.
+
 ## Configuration surface
 
 The following illustrative flags are recognized by `FullNode`:
@@ -217,6 +258,8 @@ The following illustrative flags are recognized by `FullNode`:
 --experimental-hnsr-relay
 --experimental-hnsr-rendezvous
 --experimental-hnsr-web
+--experimental-hnsr-testnet
+--experimental-hnsr-persist=<true|false>
 --experimental-hnsr-timeout=<milliseconds>
 ```
 
