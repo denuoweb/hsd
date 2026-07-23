@@ -1,8 +1,8 @@
 # Experimental HNSR proof of concept
 
 This branch contains a deliberately bounded, regtest-only implementation of
-the unnamed `HNS_NODE_V1` path from the draft **Handshake P2P Rendezvous and
-Authenticated Service Relay** HIP.
+the Phase 1 `HNS_NODE_V1` and `HNS_WEB_V1` paths from the draft **Handshake P2P
+Rendezvous and Authenticated Service Relay** HIP.
 
 It is reference code for exercising the wire shape, authorization boundaries,
 and lifecycle on actual `hsd` peers. It is not a production relay, a permanent
@@ -20,7 +20,7 @@ The roles cannot be enabled outside regtest. Nodes on other networks do not
 advertise either bit. These values are collision-prone experimental values and
 must be replaced if the protocol receives assigned values.
 
-## Implemented trial profile
+## Implemented trial profiles
 
 The branch implements:
 
@@ -56,7 +56,20 @@ The branch implements:
   and
 - actual inbound and outbound `Peer` objects in the ordinary HSD pool, running
   complete end-to-end Brontide and Handshake peer sessions over virtual circuit
-  sockets.
+  sockets;
+- current, validated, closed HNS name-state lookup and canonical
+  `hnsr1 k=<base32-key>` TXT parsing with ambiguity rejection;
+- root-signed service authorization, service-signed endpoint delegation, named
+  route-key derivation, and complete requester-side authority-chain checks;
+- replicated named `HNS_WEB_V1` records for multiple endpoints;
+- inner endpoint-authenticated Brontide carrying bounded HTTP/1.1 requests and
+  responses without exposing their plaintext to the relay;
+- strict Host, HNS authority, and service agreement, with duplicate-header,
+  transfer-encoding, upgrade, body-size, request-count, and timeout limits;
+- reusable inner web sessions for up to 16 request/response exchanges;
+- stable origin derivation from `(hnsr, name_hash, service_name, profile_id)`,
+  independent of relay, ticket, and endpoint rotation; and
+- sequential named-endpoint and per-record relay failover.
 
 The proof-of-concept handler does not forward to a requester-selected host or
 port. A circuit can terminate only at the exact live peer connection bound to
@@ -85,17 +98,22 @@ The rendezvous table is intentionally the bounded live/recently-connected
 contact set for this regtest phase. It exercises iterative XOR routing but is
 not yet the persistent bucket implementation required for a public network.
 
-### Phase 1B: named service authorization and profiles
+### Phase 1B: named-service regtest implemented here
 
-Still to implement before claiming the HIP's complete Phase 1 service surface:
+The branch completes the directly executable, bounded `HNS_WEB_V1` slice:
 
-- authenticated HNS authority lookup and canonical TXT root-key parsing;
-- service authorizations and named endpoint delegations;
-- named route-key derivation and authorization-chain validation; and
-- the `HNS_WEB_V1` handler and origin rules.
+- an on-chain regtest name auction and authenticated root-key `UPDATE`;
+- service authorization, two endpoint delegations, and four-copy named routes;
+- inner Brontide HTTP request/response and same-circuit connection reuse;
+- authority mismatch rejection and stable browser-origin derivation;
+- endpoint failure followed by authenticated fallback; and
+- web-specific cryptographic, framing, circuit, byte, and admission limits.
 
-These features are not prerequisites for review of the unnamed full-node
-transport, but they are prerequisites for claiming named HNS service support.
+This PoC intentionally buffers each bounded HTTP message (maximum 16 KiB of
+headers and 1 MiB of body) instead of providing an unbounded streaming API.
+It derives and returns the mandatory origin tuple, but HSD cannot itself
+isolate browser cookies, storage, permissions, or service workers. Native
+browser enforcement remains a Phase 3 client-integration requirement.
 
 ### Phase 2: bounded testnet hardening
 
@@ -141,36 +159,47 @@ NODE_BACKEND=js node scripts/run-hnsr-regtest-trial.js \
 `NODE_BACKEND=js` selects bcrypto's portable JavaScript backend and is not a
 protocol requirement.
 
-The trial starts eight independently keyed, independently prefixed FullNodes:
+The trial starts nine independently keyed, independently prefixed FullNodes:
 
 ```text
-Endpoint (no listener) ==> Relay A, Relay B, Rendezvous 0
-Requester              ==> Rendezvous 0
-Rendezvous 0           ==> Rendezvous 1 ==> Rendezvous 2 ==> Rendezvous 3
+Endpoint/fallback web (no listener) ==> Relay A, Relay B, Rendezvous 0
+Primary web endpoint (no listener)  ==> Relay A, Relay B, Rendezvous 0
+Requester                           ==> Rendezvous 0
+Rendezvous 0 ==> Rendezvous 1 ==> Rendezvous 2 ==> Rendezvous 3
 
 Requester == inner HNS peer ==> surviving relay ==> Endpoint
+Requester == inner HNS_WEB_V1 ==> relay ==> authenticated named endpoint
 ```
 
 It then:
 
-1. iteratively discovers all four rendezvous nodes from one bootstrap;
-2. reserves both relays and stores one signed route at all four rendezvous
-   nodes;
-3. discovers the route with `SAMPLEROUTES`;
-4. renews both tickets, republishes a higher sequence, and withdraws the old
+1. mines a shared regtest chain, auctions `phase1b`, and publishes a canonical
+   HNSR root key in its authenticated resource;
+2. authorizes `p2p-site`, registers two named web endpoints, and publishes both
+   named records to four rendezvous nodes;
+3. performs an HTTP request over inner Brontide, reuses another inner circuit
+   for two requests, rejects a mismatched authority with status 421, and proves
+   relay DATA frames do not contain the response plaintext;
+4. disconnects the primary named endpoint and reaches the fallback endpoint
+   after rejecting the stale higher-sequence candidate;
+5. iteratively discovers all four rendezvous nodes from one bootstrap;
+6. reserves both relays and stores one signed unnamed route at all four
+   rendezvous nodes;
+7. discovers the unnamed route with `SAMPLEROUTES`;
+8. renews both tickets, republishes a higher sequence, and withdraws the old
    reservations;
-5. issues 72 concurrent lookup requests and verifies bounded admission;
-6. stops one rendezvous node and retrieves the refreshed record from the three
+9. issues 72 concurrent lookup requests and verifies bounded admission;
+10. stops one rendezvous node and retrieves the refreshed record from the three
    survivors;
-7. stops Relay A and verifies automatic fallback to Relay B;
-8. constructs ordinary inbound/outbound HSD `Peer` objects over the circuit
+11. stops Relay A and verifies automatic fallback to Relay B;
+12. constructs ordinary inbound/outbound HSD `Peer` objects over the circuit
    and verifies both inner static identities;
-9. sends 1,000 ordinary Handshake pings while mining and relaying a real block;
-10. proves only endpoint and requester reach height 1 while both relays and all
-    four rendezvous chains remain at height 0;
-11. verifies bounded queues, multiple scheduler yields, a control reservation
+13. sends 1,000 ordinary Handshake pings while mining and relaying a real block;
+14. proves only endpoint and requester advance from height 47 to 48 while both
+    relays and all rendezvous controls remain at height 47;
+15. verifies bounded queues, multiple scheduler yields, a control reservation
     during load, and zero relay drops; and
-12. disconnects the endpoint, retrieves the intentionally stale route, and
+16. disconnects the endpoint, retrieves the intentionally stale route, and
     confirms the surviving relay rejects its invalid ticket.
 
 The checked-in `docs/hnsr-regtest-phase1.json` is one passing run. It records
@@ -187,6 +216,7 @@ The following illustrative flags are recognized by `FullNode`:
 --experimental-hnsr-endpoint
 --experimental-hnsr-relay
 --experimental-hnsr-rendezvous
+--experimental-hnsr-web
 --experimental-hnsr-timeout=<milliseconds>
 ```
 

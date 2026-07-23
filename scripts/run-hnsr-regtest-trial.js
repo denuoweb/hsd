@@ -6,6 +6,7 @@ const assert = require('bsert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const base32 = require('bcrypto/lib/encoding/base32');
 const secp256k1 = require('bcrypto/lib/secp256k1');
 const sha256 = require('bcrypto/lib/sha256');
 const FullNode = require('../lib/node/fullnode');
@@ -13,7 +14,17 @@ const Address = require('../lib/primitives/address');
 const NetAddress = require('../lib/net/netaddress');
 const packets = require('../lib/net/packets');
 const common = require('../lib/net/common');
-const {opcodes, routeKey} = require('../lib/net/hnsr');
+const rules = require('../lib/covenants/rules');
+const {Resource} = require('../lib/dns/resource');
+const walletPlugin = require('../lib/wallet/plugin');
+const {BrontideStream} = require('../lib/net/brontide');
+const {
+  opcodes,
+  profiles,
+  routeKey,
+  ServiceAuthorization,
+  HTTPMessageParser
+} = require('../lib/net/hnsr');
 
 function waitFor(test, message, timeout = 15000) {
   const start = Date.now();
@@ -113,7 +124,8 @@ function ports(base, index) {
   return {
     p2p: base + index,
     brontide: base + 16 + index,
-    http: base + 32 + index
+    http: base + 32 + index,
+    wallet: base + 48 + index
   };
 }
 
@@ -148,6 +160,66 @@ async function closeNode(node, opened) {
     opened.splice(index, 1);
 }
 
+async function mineShared(producer, nodes, count, address) {
+  for (let i = 0; i < count; i++) {
+    const block = await producer.miner.mineBlock(producer.chain.tip, address);
+    const height = producer.chain.height + 1;
+
+    await Promise.all(nodes.map(async (node) => {
+      if (node.chain.height < height)
+        await node.chain.add(block);
+    }));
+
+    assert(nodes.every(node => node.chain.height === height));
+  }
+}
+
+async function rawWebExchange(service, record, raw) {
+  const circuit = await service.openRoute(record);
+  const stream = BrontideStream.fromOutbound(
+    circuit.socket,
+    service.identityKey,
+    record.delegation.endpointKey);
+  const parser = new HTTPMessageParser('response');
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const finish = (error, response) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      stream.destroy();
+      circuit.socket.destroy();
+
+      if (error)
+        reject(error);
+      else
+        resolve(response);
+    };
+    timer = setTimeout(
+      () => finish(new Error('Raw HNSR web exchange timed out.')),
+      common.hnsr.INNER_HANDSHAKE_TIMEOUT);
+
+    circuit.socket.once('close', () => {
+      finish(new Error('Raw HNSR web circuit closed.'));
+    });
+    stream.once('error', finish);
+    stream.once('connect', () => stream.write(raw));
+    stream.on('data', (data) => {
+      try {
+        const messages = parser.feed(data);
+
+        if (messages.length !== 0)
+          finish(null, messages[0]);
+      } catch (e) {
+        finish(e);
+      }
+    });
+  });
+}
+
 async function main() {
   const artifact = process.argv[2] ? path.resolve(process.argv[2]) : null;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hsd-hnsr-regtest-'));
@@ -156,6 +228,7 @@ async function main() {
     relays: [identity(), identity()],
     rendezvous: [identity(), identity(), identity(), identity()],
     endpoint: identity(),
+    webEndpoint: identity(),
     requester: identity()
   };
   const nodePorts = {
@@ -167,13 +240,15 @@ async function main() {
       ports(base, 5)
     ],
     endpoint: ports(base, 6),
-    requester: ports(base, 7)
+    requester: ports(base, 7),
+    webEndpoint: ports(base, 8)
   };
   const opened = [];
   const wireCounts = {};
   const relayWirePayloads = new Map();
   const nodes = [];
   let endpoint = null;
+  let webEndpoint = null;
   let requester = null;
 
   try {
@@ -182,12 +257,20 @@ async function main() {
         path.join(root, `relay-${index}`),
         key,
         nodePorts.relays[index],
-        {experimentalHnsrRelay: true}));
+        {
+          experimentalHnsrRelay: true,
+          experimentalHnsrWeb: true
+        }));
     });
     const rendezvous = new Array(4);
 
     for (let index = 3; index >= 0; index--) {
       const extra = {experimentalHnsrRendezvous: true};
+
+      if (index === 0) {
+        extra.plugins = [walletPlugin];
+        extra.walletHttpPort = nodePorts.rendezvous[index].wallet;
+      }
 
       if (index < 3) {
         extra.nodes = [nodeAddress(
@@ -230,6 +313,17 @@ async function main() {
       {
         listen: false,
         experimentalHnsrEndpoint: true,
+        experimentalHnsrWeb: true,
+        nodes: [...relayAddresses, rendezvousBootstrap]
+      }));
+    webEndpoint = new FullNode(nodeOptions(
+      path.join(root, 'web-endpoint'),
+      identities.webEndpoint,
+      nodePorts.webEndpoint,
+      {
+        listen: false,
+        experimentalHnsrEndpoint: true,
+        experimentalHnsrWeb: true,
         nodes: [...relayAddresses, rendezvousBootstrap]
       }));
     requester = new FullNode(nodeOptions(
@@ -237,16 +331,95 @@ async function main() {
       identities.requester,
       nodePorts.requester,
       {listen: false, nodes: [rendezvousBootstrap]}));
-    nodes.push(endpoint, requester);
+    nodes.push(endpoint, webEndpoint, requester);
 
     await openNode(endpoint, opened);
+    await openNode(webEndpoint, opened);
     await openNode(requester, opened);
 
     await waitFor(() => {
       return identities.relays.every(key => findPeer(endpoint, key))
+        && identities.relays.every(key => findPeer(webEndpoint, key))
         && findPeer(endpoint, identities.rendezvous[0])
+        && findPeer(webEndpoint, identities.rendezvous[0])
         && findPeer(requester, identities.rendezvous[0]);
     }, 'Endpoint and requester bootstrap peers did not authenticate.');
+
+    const rootPrivate = identity();
+    const rootKey = publicKey(rootPrivate);
+    const servicePrivate = identity();
+    const serviceKey = publicKey(servicePrivate);
+    const rootName = 'phase1b';
+    const serviceName = 'p2p-site';
+    const rootResource = Resource.fromJSON({
+      records: [{
+        type: 'TXT',
+        txt: [`hnsr1 k=${base32.encode(rootKey)}`]
+      }]
+    });
+    const {wdb} = rendezvous[0].require('walletdb');
+    const wallet = await wdb.create();
+    const miningAddress = await wallet.receiveAddress();
+    const [rolloutHeight] = rules.getRollout(
+      rules.hashName(rootName),
+      endpoint.network);
+
+    await mineShared(
+      rendezvous[0],
+      nodes,
+      Math.max(3, rolloutHeight),
+      miningAddress);
+    await wdb.rescan(0);
+    await wallet.sendOpen(rootName);
+    await mineShared(
+      rendezvous[0],
+      nodes,
+      endpoint.network.names.treeInterval + 1,
+      miningAddress);
+    await wdb.rescan(0);
+    await wallet.sendBid(rootName, 100000, 200000);
+    await mineShared(
+      rendezvous[0],
+      nodes,
+      endpoint.network.names.biddingPeriod,
+      miningAddress);
+    await wdb.rescan(0);
+    await wallet.sendReveal(rootName);
+    await mineShared(
+      rendezvous[0],
+      nodes,
+      endpoint.network.names.revealPeriod + 1,
+      miningAddress);
+    await wdb.rescan(0);
+    await wallet.sendUpdate(rootName, rootResource);
+    await mineShared(
+      rendezvous[0],
+      nodes,
+      endpoint.network.names.treeInterval,
+      miningAddress);
+    await wdb.rescan(0);
+
+    const nameHeight = rendezvous[0].chain.height;
+    const authorization = new ServiceAuthorization({
+      networkMagic: endpoint.network.magic,
+      nameHash: rules.hashName(rootName),
+      serviceName,
+      profile: profiles.HNS_WEB_V1,
+      serviceKey,
+      serial: 1,
+      validFromHeight: nameHeight,
+      validUntilHeight: nameHeight + 1000,
+      maxEndpointLifetime: 3600,
+      maxRouteLifetime: 900
+    }).sign(endpoint.network.magic, rootPrivate);
+    const endpointAuthority = await endpoint.hnsr.resolveNamedAuthority(
+      rootName);
+    const requesterAuthority = await requester.hnsr.resolveNamedAuthority(
+      rootName);
+
+    assert(endpointAuthority.rootKey.equals(rootKey));
+    assert(requesterAuthority.rootKey.equals(rootKey));
+    assert(authorization.verify(rootKey, endpoint.network.magic, nameHeight));
 
     for (const node of nodes) {
       node.chain.synced = true;
@@ -265,11 +438,16 @@ async function main() {
 
     const endpointRelays = identities.relays.map(
       key => findPeer(endpoint, key));
+    const webEndpointRelays = identities.relays.map(
+      key => findPeer(webEndpoint, key));
     const endpointRendezvous = findPeer(
       endpoint,
       identities.rendezvous[0]);
     const requesterRendezvous = findPeer(
       requester,
+      identities.rendezvous[0]);
+    const webEndpointRendezvous = findPeer(
+      webEndpoint,
       identities.rendezvous[0]);
     const reservationOptions = {
       lifetime: 1800,
@@ -324,6 +502,146 @@ async function main() {
       return endpoint.hnsr.withdraw(peer, initialTickets[index]);
     }));
     assert(relays.every(node => node.hnsr.reservations.size === 1));
+
+    await endpoint.hnsr.registerWebService(
+      rootName,
+      authorization,
+      async request => ({
+        statusCode: 200,
+        headers: {'Content-Type': 'text/plain; charset=utf-8'},
+        body: `fallback:${request.path}`
+      }));
+    await webEndpoint.hnsr.registerWebService(
+      rootName,
+      authorization,
+      async request => ({
+        statusCode: 200,
+        headers: {'Content-Type': 'text/plain; charset=utf-8'},
+        body: `primary:${request.path}`
+      }));
+
+    const webReservationOptions = {
+      profile: profiles.HNS_WEB_V1,
+      lifetime: 1800,
+      maxCircuits: 4,
+      maxBytes: 4 * 1024 * 1024
+    };
+    const fallbackWebTickets = await Promise.all(endpointRelays.map((peer) => {
+      return endpoint.hnsr.reserve(peer, webReservationOptions);
+    }));
+    const primaryWebTickets = await Promise.all(
+      webEndpointRelays.map((peer) => {
+        return webEndpoint.hnsr.reserve(peer, webReservationOptions);
+      }));
+    const fallbackWebPublication = await endpoint.hnsr.publishNamedReplicated(
+      endpointRendezvous,
+      fallbackWebTickets,
+      authorization,
+      servicePrivate,
+      {lifetime: 900, replicas: 4, minimumStores: 4});
+    const primaryWebPublication = await webEndpoint.hnsr.publishNamedReplicated(
+      webEndpointRendezvous,
+      primaryWebTickets,
+      authorization,
+      servicePrivate,
+      {
+        sequence: 10,
+        endpointSequence: 10,
+        lifetime: 900,
+        replicas: 4,
+        minimumStores: 4
+      });
+
+    assert.strictEqual(fallbackWebPublication.stored.length, 4);
+    assert.strictEqual(primaryWebPublication.stored.length, 4);
+    assert(rendezvous.every(node => node.hnsr.store.size === 3));
+
+    const webURI = `hnsr://${rootName}/${serviceName}/hello?phase=1b`;
+    const webTranscriptStart = relays.map(
+      node => relayWirePayloads.get(node).length);
+    const primaryWebResponse = await requester.hnsr.requestNamedWeb(
+      requesterRendezvous,
+      webURI);
+
+    assert.strictEqual(primaryWebResponse.statusCode, 200);
+    assert.strictEqual(
+      primaryWebResponse.body.toString('utf8'),
+      'primary:/hello?phase=1b');
+    assert.strictEqual(
+      primaryWebResponse.origin.key,
+      `hnsr:${rules.hashName(rootName).toString('hex')}:${serviceName}:2`);
+
+    const reusableWeb = await requester.hnsr.openNamedWeb(
+      requesterRendezvous,
+      webURI);
+    const reusedResponses = [];
+
+    for (let index = 0;
+      index < common.hnsr.MAX_WEB_REQUESTS_PER_CIRCUIT;
+      index++) {
+      reusedResponses.push(await reusableWeb.session.request(
+        rootName,
+        serviceName,
+        {path: `/reuse/${index + 1}`}));
+    }
+
+    await assert.rejects(
+      reusableWeb.session.request(rootName, serviceName, {path: '/reuse/17'}),
+      /request limit/);
+    reusableWeb.session.close();
+
+    assert(reusedResponses.every((response) => {
+      return response.circuit === reusedResponses[0].circuit;
+    }));
+    assert.strictEqual(
+      reusedResponses[0].body.toString('utf8'),
+      'primary:/reuse/1');
+    assert.strictEqual(
+      reusedResponses[reusedResponses.length - 1].body.toString('utf8'),
+      'primary:/reuse/16');
+
+    const wrongAuthority = Buffer.from(
+      'GET / HTTP/1.1\r\n'
+      + `Host: attacker.${rootName}\r\n`
+      + `HNSR-Authority: ${rootName}\r\n`
+      + `HNSR-Service: ${serviceName}\r\n`
+      + 'Content-Length: 0\r\n\r\n',
+      'ascii');
+    const rejectedAuthority = await rawWebExchange(
+      requester.hnsr,
+      primaryWebPublication.record,
+      wrongAuthority);
+    assert.strictEqual(rejectedAuthority.statusCode, 421);
+
+    await assert.rejects(async () => {
+      await endpoint.hnsr.reserve(endpointRelays[0], {
+        profile: profiles.HNS_WEB_V1,
+        lifetime: 1800,
+        maxCircuits: 5,
+        maxBytes: 1024
+      });
+    });
+
+    await closeNode(webEndpoint, opened);
+    await waitFor(
+      () => relays.every(node => node.hnsr.reservations.size === 2),
+      'Relays did not invalidate the disconnected primary web endpoint.');
+
+    const failedOverWebResponse = await requester.hnsr.requestNamedWeb(
+      requesterRendezvous,
+      webURI);
+    assert.strictEqual(failedOverWebResponse.statusCode, 200);
+    assert.strictEqual(
+      failedOverWebResponse.body.toString('utf8'),
+      'fallback:/hello?phase=1b');
+    assert.strictEqual(failedOverWebResponse.failures.length, 1);
+    const webPlaintextObserved = relays.some((node, index) => {
+      return relayWirePayloads.get(node)
+        .slice(webTranscriptStart[index])
+        .some(raw => raw.includes(Buffer.from('primary:/hello?phase=1b'))
+          || raw.includes(Buffer.from('fallback:/hello?phase=1b')));
+    });
+    assert.strictEqual(webPlaintextObserved, false);
 
     await new Promise(resolve => setTimeout(resolve, 1100));
     const admission = await Promise.allSettled(new Array(72).fill(null).map(
@@ -407,7 +725,7 @@ async function main() {
     const propagationStarted = Date.now();
     await endpoint.chain.add(block);
     await waitFor(
-      () => requester.chain.height === 1,
+      () => requester.chain.height === nameHeight + 1,
       () => {
         return 'Inner block did not converge ('
           + `requester=${requester.chain.height}).`;
@@ -424,10 +742,10 @@ async function main() {
       30000);
     await requesterVirtual.drain();
 
-    assert.strictEqual(endpoint.chain.height, 1);
-    assert.strictEqual(requester.chain.height, 1);
-    assert(relays.every(node => node.chain.height === 0));
-    assert(rendezvous.every(node => node.chain.height === 0));
+    assert.strictEqual(endpoint.chain.height, nameHeight + 1);
+    assert.strictEqual(requester.chain.height, nameHeight + 1);
+    assert(relays.every(node => node.chain.height === nameHeight));
+    assert(rendezvous.every(node => node.chain.height === nameHeight));
     assert(relay.hnsr.relayFrames > loadPackets);
     assert(relay.hnsr.relayFlushes > 1);
     assert(relay.hnsr.maxRelayQueuedBytes > common.hnsr.RELAY_BURST);
@@ -437,9 +755,9 @@ async function main() {
     const controlNodeHeights = [...relays, ...rendezvous]
       .map(node => node.chain.height);
 
-    assert(controlNodeHeights.every(height => height === 0));
+    assert(controlNodeHeights.every(height => height === nameHeight));
 
-    assert.strictEqual(relay.hnsr.reservations.size, 1);
+    assert.strictEqual(relay.hnsr.reservations.size, 2);
     assert.strictEqual(
       relayWirePayloads.get(relay).slice(payloadStart)
         .some(raw => raw.includes(blockHash)),
@@ -471,7 +789,7 @@ async function main() {
       ? Buffer.concat(relayWirePayloads.get(relay))
       : Buffer.alloc(0);
     const result = {
-      schema: 2,
+      schema: 3,
       network: 'regtest',
       assignment: {
         rendezvousServiceBit:
@@ -481,7 +799,7 @@ async function main() {
         packetType: `0x${common.EXPERIMENTAL_HNSR.toString(16)}`
       },
       topology: {
-        fullNodes: 8,
+        fullNodes: 9,
         relays: 2,
         rendezvousNodes: 4,
         endpointListeners: 0,
@@ -502,6 +820,40 @@ async function main() {
         refreshedStoredCopies: refreshed.stored.length,
         survivingStores: activeRendezvous.map(node => node.hnsr.store.size),
         rendezvousFailureRecovered: replicatedLookup.records.length === 1
+      },
+      namedWeb: {
+        rootName,
+        serviceName,
+        hnsStateHeight: nameHeight,
+        canonicalRootKeyAuthenticated:
+          requesterAuthority.rootKey.equals(rootKey),
+        serviceAuthorizationVerified: authorization.verify(
+          rootKey,
+          endpoint.network.magic,
+          nameHeight),
+        namedRouteCopies: primaryWebPublication.stored.length,
+        namedEndpoints: 2,
+        profile: 'HNS_WEB_V1',
+        innerBrontide: true,
+        initialStatusCode: primaryWebResponse.statusCode,
+        initialBody: primaryWebResponse.body.toString('utf8'),
+        connectionReuse: reusedResponses.every((response) => {
+          return response.circuit === reusedResponses[0].circuit;
+        }),
+        reusedRequests: reusedResponses.length,
+        firstReusedBody: reusedResponses[0].body.toString('utf8'),
+        lastReusedBody:
+          reusedResponses[reusedResponses.length - 1].body.toString('utf8'),
+        origin: primaryWebResponse.origin.key,
+        authorityMismatchStatus: rejectedAuthority.statusCode,
+        primaryEndpointStopped: true,
+        failedEndpointCandidates: failedOverWebResponse.failures.length,
+        failoverStatusCode: failedOverWebResponse.statusCode,
+        failoverBody: failedOverWebResponse.body.toString('utf8'),
+        relayObservedPlaintext: webPlaintextObserved,
+        maximumBodyBytes: common.hnsr.MAX_WEB_BODY_SIZE,
+        maximumRequestsPerCircuit:
+          common.hnsr.MAX_WEB_REQUESTS_PER_CIRCUIT
       },
       lifecycle: {
         initialSequence: publication.record.sequence,
@@ -531,11 +883,12 @@ async function main() {
       },
       blockTraffic: {
         hash: blockHash.toString('hex'),
-        endpointHeight: 1,
+        baselineHeight: nameHeight,
+        endpointHeight: nameHeight + 1,
         requesterHeight: requester.chain.height,
         controlNodeHeights,
         deliveredOnlyByInnerPeer: controlNodeHeights
-          .every(height => height === 0),
+          .every(height => height === nameHeight),
         latencyMs: blockLatency
       },
       saturation: {

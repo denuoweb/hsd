@@ -1,14 +1,18 @@
 'use strict';
 
 const assert = require('bsert');
+const base32 = require('bcrypto/lib/encoding/base32');
 const secp256k1 = require('bcrypto/lib/secp256k1');
 const FullNode = require('../lib/node/fullnode');
 const Network = require('../lib/protocol/network');
 const common = require('../lib/net/common');
 const packets = require('../lib/net/packets');
+const rules = require('../lib/covenants/rules');
+const {Resource} = require('../lib/dns/resource');
 const {
   ReserveRequest,
   RelayTicket,
+  ServiceAuthorization,
   EndpointDelegation,
   RouteRecord,
   RouteStore,
@@ -17,7 +21,15 @@ const {
   rendezvousNodeID,
   compareDistance,
   opcodes,
-  routeKey
+  profiles,
+  routeKey,
+  namedRouteKey,
+  parseHNSRRootKey,
+  parseHNSRURI,
+  webOrigin,
+  HTTPMessageParser,
+  encodeWebRequest,
+  encodeWebResponse
 } = require('../lib/net/hnsr');
 
 const network = Network.get('regtest');
@@ -88,7 +100,316 @@ function fixture(timestamp = Math.floor(Date.now() / 1000), sequence = 1) {
   };
 }
 
+function namedFixture(timestamp = Math.floor(Date.now() / 1000)) {
+  const rootPrivate = secp256k1.privateKeyGenerate();
+  const rootKey = secp256k1.publicKeyCreate(rootPrivate, true);
+  const servicePrivate = secp256k1.privateKeyGenerate();
+  const serviceKey = secp256k1.publicKeyCreate(servicePrivate, true);
+  const endpointPrivate = secp256k1.privateKeyGenerate();
+  const endpointKey = secp256k1.publicKeyCreate(endpointPrivate, true);
+  const relayPrivate = secp256k1.privateKeyGenerate();
+  const relayKey = secp256k1.publicKeyCreate(relayPrivate, true);
+  const nameHash = rules.hashName('denuoweb');
+  const authorization = new ServiceAuthorization({
+    networkMagic: network.magic,
+    nameHash,
+    serviceName: 'p2p-site',
+    profile: profiles.HNS_WEB_V1,
+    serviceKey,
+    serial: 7,
+    validFromHeight: 5,
+    validUntilHeight: 100,
+    maxEndpointLifetime: 3600,
+    maxRouteLifetime: 900
+  }).sign(network.magic, rootPrivate);
+  const ticket = new RelayTicket({
+    networkMagic: network.magic,
+    profile: profiles.HNS_WEB_V1,
+    hostType: 1,
+    host: Buffer.alloc(16),
+    port: network.brontidePort,
+    relayKey,
+    endpointKey,
+    reservationID: Buffer.alloc(16, 0x02),
+    issuedAt: timestamp,
+    expiresAt: timestamp + 1800,
+    maxActiveCircuits: 4,
+    maxBytesPerCircuit: 1048576,
+    maxTotalBytes: 4194304
+  }).signRelay(relayPrivate).signEndpoint(endpointPrivate);
+  const delegation = new EndpointDelegation({
+    authorizationID: authorization.id(),
+    endpointKey,
+    sequence: 3,
+    issuedAt: timestamp,
+    expiresAt: timestamp + 900,
+    maxActiveCircuits: 4,
+    maxBytesPerCircuit: 1048576
+  }).sign(network.magic, servicePrivate);
+  const key = namedRouteKey(
+    network.magic,
+    nameHash,
+    authorization.serviceName,
+    authorization.profile);
+  const record = new RouteRecord({
+    authorityType: 1,
+    routeKey: key,
+    profile: profiles.HNS_WEB_V1,
+    sequence: 4,
+    issuedAt: timestamp,
+    expiresAt: timestamp + 900,
+    authorization: authorization.encode(),
+    delegation,
+    tickets: [ticket]
+  }).sign(endpointPrivate);
+
+  return {
+    rootPrivate,
+    rootKey,
+    servicePrivate,
+    serviceKey,
+    endpointPrivate,
+    endpointKey,
+    authorization,
+    ticket,
+    delegation,
+    key,
+    record,
+    timestamp
+  };
+}
+
 describe('HNSR', function() {
+  it('should parse exactly one canonical HNSR root key from HNS TXT', () => {
+    const rootPrivate = secp256k1.privateKeyGenerate();
+    const rootKey = secp256k1.publicKeyCreate(rootPrivate, true);
+    const encoded = base32.encode(rootKey);
+    const resource = Resource.fromJSON({
+      records: [
+        {type: 'TXT', txt: ['unrelated=value']},
+        {type: 'TXT', txt: [`hnsr1 k=${encoded}`]}
+      ]
+    });
+
+    assert.bufferEqual(parseHNSRRootKey(resource), rootKey);
+
+    resource.records.push(Resource.fromJSON({
+      records: [{type: 'TXT', txt: [`hnsr1 k=${encoded}`]}]
+    }).records[0]);
+    assert.throws(() => parseHNSRRootKey(resource), /ambiguous/);
+
+    const noncanonical = Resource.fromJSON({
+      records: [{type: 'TXT', txt: [`HNSR1 k=${encoded}`]}]
+    });
+    assert.throws(() => parseHNSRRootKey(noncanonical), /no canonical/);
+  });
+
+  it('should authenticate and store a named web route trust chain', () => {
+    const item = namedFixture();
+    const decodedAuthorization = ServiceAuthorization.decode(
+      item.authorization.encode());
+    const decodedRecord = RouteRecord.decode(item.record.encode());
+
+    assert(decodedAuthorization.verify(item.rootKey, network.magic, 50));
+    assert.bufferEqual(decodedAuthorization.id(), item.authorization.id());
+    assert(decodedRecord.verify(network.magic, item.timestamp, {
+      rootKey: item.rootKey,
+      height: 50
+    }));
+
+    const store = new RouteStore(network.magic);
+    store.put(item.key, item.record.encode(), item.timestamp, 'publisher');
+    assert.strictEqual(store.get(item.key, 1, item.timestamp).length, 1);
+    assert.strictEqual(store.sample(
+      1,
+      Buffer.alloc(32, 0x03),
+      item.timestamp).length, 0);
+  });
+
+  it('should reject named routes outside their HNS authorization', () => {
+    const item = namedFixture();
+    const otherRoot = secp256k1.publicKeyCreate(
+      secp256k1.privateKeyGenerate(),
+      true);
+
+    assert(!item.record.verify(network.magic, item.timestamp, {
+      rootKey: otherRoot,
+      height: 50
+    }));
+    assert(!item.record.verify(network.magic, item.timestamp, {
+      rootKey: item.rootKey,
+      height: 101
+    }));
+
+    const substituted = RouteRecord.decode(item.record.encode());
+    substituted.routeKey = Buffer.alloc(32, 0x04);
+    substituted.sign(item.endpointPrivate);
+    assert(!substituted.verify(network.magic, item.timestamp, {
+      rootKey: item.rootKey,
+      height: 50
+    }));
+  });
+
+  it('should reject malformed named authorization chains', () => {
+    const item = namedFixture();
+    const highAuthorization = ServiceAuthorization.decode(
+      item.authorization.encode());
+
+    assert.strictEqual(
+      highAuthorization.verify(item.rootKey, network.magic + 1, 50),
+      false);
+
+    highAuthorization.rootSignature = highS(
+      highAuthorization.rootSignature);
+    assert.strictEqual(
+      secp256k1.isLowDER(highAuthorization.rootSignature),
+      false);
+    assert.strictEqual(
+      highAuthorization.verify(item.rootKey, network.magic, 50),
+      false);
+
+    const mismatched = RouteRecord.decode(item.record.encode());
+    mismatched.delegation.authorizationID = Buffer.alloc(32, 0x05);
+    mismatched.delegation.sign(network.magic, item.servicePrivate);
+    mismatched.sign(item.endpointPrivate);
+    assert.strictEqual(mismatched.verify(network.magic, item.timestamp, {
+      rootKey: item.rootKey,
+      height: 50
+    }), false);
+
+    const overlong = RouteRecord.decode(item.record.encode());
+    overlong.delegation.expiresAt = item.timestamp
+      + item.authorization.maxEndpointLifetime + 1;
+    overlong.delegation.sign(network.magic, item.servicePrivate);
+    overlong.sign(item.endpointPrivate);
+    assert.strictEqual(overlong.verify(network.magic, item.timestamp, {
+      rootKey: item.rootKey,
+      height: 50
+    }), false);
+
+    const raw = item.authorization.encode();
+    const unknownVersion = Buffer.from(raw);
+    unknownVersion[0] = 2;
+    assert.throws(() => ServiceAuthorization.decode(raw.slice(0, -1)));
+    assert.throws(() => ServiceAuthorization.decode(Buffer.concat([
+      raw,
+      Buffer.from([0x00])
+    ])), /Trailing bytes/);
+    assert.throws(() => ServiceAuthorization.decode(unknownVersion));
+  });
+
+  it('should derive a stable named browser origin independent of relays', () => {
+    const item = namedFixture();
+    const target = parseHNSRURI(
+      'hnsr://denuoweb/p2p-site/articles/one?q=handshake#section');
+    const first = webOrigin(
+      item.authorization.nameHash,
+      target.serviceName,
+      profiles.HNS_WEB_V1);
+    const second = webOrigin(
+      item.authorization.nameHash,
+      target.serviceName,
+      profiles.HNS_WEB_V1);
+
+    assert.strictEqual(target.rootName, 'denuoweb');
+    assert.strictEqual(target.serviceName, 'p2p-site');
+    assert.strictEqual(target.path, '/articles/one?q=handshake');
+    assert.strictEqual(first.key, second.key);
+    assert(!first.key.includes(item.ticket.relayKey.toString('hex')));
+    assert(!first.key.includes(item.endpointKey.toString('hex')));
+    assert.notStrictEqual(
+      first.key,
+      webOrigin(
+        rules.hashName('other-name'),
+        target.serviceName,
+        profiles.HNS_WEB_V1).key);
+    assert.notStrictEqual(
+      first.key,
+      webOrigin(
+        item.authorization.nameHash,
+        'other-service',
+        profiles.HNS_WEB_V1).key);
+    assert.throws(
+      () => parseHNSRURI('hnsr://denuoweb/P2P-site/'),
+      /service name/);
+  });
+
+  it('should enforce HNSR web authority and bounded HTTP framing', () => {
+    const request = encodeWebRequest('denuoweb', 'p2p-site', {
+      method: 'POST',
+      path: '/submit',
+      headers: {'Content-Type': 'text/plain'},
+      body: 'hello'
+    });
+    const parser = new HTTPMessageParser('request');
+    const messages = [
+      ...parser.feed(request.slice(0, 11)),
+      ...parser.feed(request.slice(11))
+    ];
+
+    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(messages[0].method, 'POST');
+    assert.strictEqual(messages[0].headers.get('host'), 'p2p-site.denuoweb');
+    assert.strictEqual(
+      messages[0].headers.get('hnsr-authority'),
+      'denuoweb');
+    assert.strictEqual(messages[0].headers.get('hnsr-service'), 'p2p-site');
+    assert.bufferEqual(messages[0].body, Buffer.from('hello'));
+
+    const responseParser = new HTTPMessageParser('response');
+    const response = responseParser.feed(encodeWebResponse({
+      statusCode: 201,
+      reason: 'Created',
+      body: 'stored'
+    }))[0];
+    assert.strictEqual(response.statusCode, 201);
+    assert.bufferEqual(response.body, Buffer.from('stored'));
+
+    assert.throws(() => encodeWebRequest('denuoweb', 'p2p-site', {
+      headers: {Host: 'attacker.invalid'}
+    }), /reserved/);
+    assert.throws(() => parser.feed(Buffer.from(
+      'POST / HTTP/1.1\r\n'
+      + 'Host: p2p-site.denuoweb\r\n'
+      + 'HNSR-Authority: denuoweb\r\n'
+      + 'HNSR-Service: p2p-site\r\n'
+      + 'Transfer-Encoding: chunked\r\n\r\n')),
+    /upgrade is not permitted/);
+    assert.throws(() => encodeWebResponse({
+      body: Buffer.alloc(common.hnsr.MAX_WEB_BODY_SIZE + 1)
+    }), /response/);
+
+    const pipelined = new HTTPMessageParser('response').feed(Buffer.concat([
+      encodeWebResponse({body: 'one'}),
+      encodeWebResponse({body: 'two'})
+    ]));
+    assert.strictEqual(pipelined.length, 2);
+    assert.bufferEqual(pipelined[0].body, Buffer.from('one'));
+    assert.bufferEqual(pipelined[1].body, Buffer.from('two'));
+
+    assert.throws(() => new HTTPMessageParser('request').feed(Buffer.from(
+      'GET / HTTP/1.1\r\n'
+      + 'Host: p2p-site.denuoweb\r\n'
+      + 'Host: attacker.invalid\r\n'
+      + 'HNSR-Authority: denuoweb\r\n'
+      + 'HNSR-Service: p2p-site\r\n'
+      + 'Content-Length: 0\r\n\r\n')),
+    /duplicate/);
+    assert.throws(() => new HTTPMessageParser('request').feed(Buffer.from(
+      'POST / HTTP/1.1\r\n'
+      + 'Host: p2p-site.denuoweb\r\n'
+      + 'HNSR-Authority: denuoweb\r\n'
+      + 'HNSR-Service: p2p-site\r\n'
+      + 'Content-Length: 0\r\n'
+      + 'Content-Length: 4\r\n\r\ntest')),
+    /duplicate/);
+    assert.throws(() => new HTTPMessageParser('request').feed(Buffer.from(
+      'GET / HTTP/1.1\r\nX-Fill: '
+      + 'a'.repeat(common.hnsr.MAX_WEB_HEADER_SIZE)
+      + '\r\n\r\n')),
+    /header exceeds/);
+  });
+
   it('should round trip the private HNSR envelope', () => {
     const context = Buffer.from('0102030405060708', 'hex');
     const body = Buffer.from('deadbeef', 'hex');
