@@ -316,10 +316,10 @@ describe('Experimental DNS Relay', function() {
 
     it('should preserve unassigned packets as unknown', () => {
       const raw = Buffer.from('01020304', 'hex');
-      const packet = packets.decode(0xf2, raw);
+      const packet = packets.decode(0xf3, raw);
 
       assert(packet instanceof packets.UnknownPacket);
-      assert.strictEqual(packet.rawType, 0xf2);
+      assert.strictEqual(packet.rawType, 0xf3);
       assert.bufferEqual(packet.data, raw);
     });
 
