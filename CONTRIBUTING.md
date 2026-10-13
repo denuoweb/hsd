@@ -2,7 +2,7 @@
 
 ## Code style
 
-This repository includes a file [.eslintrc.json](.eslintrc.json) which sets
+This repository includes [eslint.config.cjs](eslint.config.cjs), which sets
 linting preferences for the project. The continuous integration bot will
 install [bslint](https://www.npmjs.com/package/bslint) which vendors a specific
 version of eslint and [jsdoc](https://www.npmjs.com/package/jsdoc). Before
